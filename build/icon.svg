@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 圆角方背景渐变（暖暮光） -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbe7c2"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <!-- 狗毛色：金毛径向高光 -->
+    <radialGradient id="fur" cx="40%" cy="32%" r="80%">
+      <stop offset="0" stop-color="#f3d8a9"/>
+      <stop offset="0.55" stop-color="#d4a574"/>
+      <stop offset="1" stop-color="#8a5e30"/>
+    </radialGradient>
+    <radialGradient id="muzzle" cx="50%" cy="35%" r="65%">
+      <stop offset="0" stop-color="#fbe6c4"/>
+      <stop offset="1" stop-color="#d4a574"/>
+    </radialGradient>
+    <radialGradient id="earDeep" cx="50%" cy="20%" r="80%">
+      <stop offset="0" stop-color="#8a5e30"/>
+      <stop offset="1" stop-color="#5e3a1c"/>
+    </radialGradient>
+    <!-- 地面投影 -->
+    <radialGradient id="shadow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="rgba(0,0,0,0.25)"/>
+      <stop offset="1" stop-color="rgba(0,0,0,0)"/>
+    </radialGradient>
+    <!-- 内部高光（背景） -->
+    <radialGradient id="bgHighlight" cx="35%" cy="20%" r="60%">
+      <stop offset="0" stop-color="rgba(255,255,255,0.4)"/>
+      <stop offset="1" stop-color="rgba(255,255,255,0)"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 圆角方背景（macOS squircle 风格） -->
+  <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#bgHighlight)"/>
+
+  <!-- 投影 -->
+  <ellipse cx="512" cy="880" rx="280" ry="32" fill="url(#shadow)"/>
+
+  <!-- 左耳（垂耳） -->
+  <path d="M 240 380
+           Q 130 440 130 660
+           Q 150 820 290 820
+           Q 340 700 340 420 Z"
+        fill="url(#earDeep)"/>
+  <path d="M 250 420
+           Q 175 470 175 640
+           Q 195 770 290 770
+           Q 320 680 320 440 Z"
+        fill="#8a5e30" opacity="0.6"/>
+
+  <!-- 右耳 -->
+  <path d="M 784 380
+           Q 894 440 894 660
+           Q 874 820 734 820
+           Q 684 700 684 420 Z"
+        fill="url(#earDeep)"/>
+  <path d="M 774 420
+           Q 849 470 849 640
+           Q 829 770 734 770
+           Q 704 680 704 440 Z"
+        fill="#8a5e30" opacity="0.6"/>
+
+  <!-- 头颅 -->
+  <ellipse cx="512" cy="530" rx="280" ry="270" fill="url(#fur)"/>
+
+  <!-- 脸颊腮红（粉嫩） -->
+  <ellipse cx="320" cy="640" rx="60" ry="35" fill="#ff8da1" opacity="0.32"/>
+  <ellipse cx="704" cy="640" rx="60" ry="35" fill="#ff8da1" opacity="0.32"/>
+
+  <!-- 眉毛 -->
+  <path d="M 360 410 Q 410 380 460 410"
+        stroke="#5e3a1c" stroke-width="14" stroke-linecap="round" fill="none"/>
+  <path d="M 564 410 Q 614 380 664 410"
+        stroke="#5e3a1c" stroke-width="14" stroke-linecap="round" fill="none"/>
+
+  <!-- 眼睛 -->
+  <ellipse cx="405" cy="490" rx="42" ry="52" fill="#1a0e06"/>
+  <circle cx="420" cy="472" r="16" fill="#ffffff"/>
+  <circle cx="398" cy="500" r="7" fill="#ffffff" opacity="0.6"/>
+
+  <ellipse cx="619" cy="490" rx="42" ry="52" fill="#1a0e06"/>
+  <circle cx="634" cy="472" r="16" fill="#ffffff"/>
+  <circle cx="612" cy="500" r="7" fill="#ffffff" opacity="0.6"/>
+
+  <!-- 口鼻凸起 -->
+  <ellipse cx="512" cy="660" rx="160" ry="110" fill="url(#muzzle)"/>
+
+  <!-- 鼻头 -->
+  <ellipse cx="512" cy="605" rx="52" ry="38" fill="#1a0e06"/>
+  <ellipse cx="496" cy="592" rx="18" ry="12" fill="#ffffff" opacity="0.6"/>
+
+  <!-- 嘴 -->
+  <path d="M 512 660 Q 512 700 470 705 Q 440 700 440 680"
+        stroke="#1a0e06" stroke-width="10" fill="none" stroke-linecap="round"/>
+  <path d="M 512 660 Q 512 700 554 705 Q 584 700 584 680"
+        stroke="#1a0e06" stroke-width="10" fill="none" stroke-linecap="round"/>
+
+  <!-- 小舌头 -->
+  <path d="M 478 705 Q 490 730 512 730 Q 534 730 546 705 Z"
+        fill="#ff7b9b"/>
+
+  <!-- 蓝色小领带（hint of office） -->
+  <path d="M 470 800 L 554 800 L 564 820 L 555 950 L 469 950 L 460 820 Z"
+        fill="#3aa8ff"/>
+  <path d="M 470 800 L 554 800 L 545 822 L 479 822 Z"
+        fill="#7bc1ff"/>
+  <path d="M 512 822 L 525 920 L 512 940 L 499 920 Z"
+        fill="rgba(0,0,0,0.15)"/>
+</svg>

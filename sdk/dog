@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+dog — Dog Office CLI 包装器
+把任何终端 agent 命令包一层，把它"输出 + 状态"实时报给 Dog Office dashboard。
+
+用法:
+  dog run "任务描述" claude "实际的提示词..."
+  dog run -- claude "..."         # -- 之后是要执行的完整命令
+  DOG_AGENT_ID=xxx DOG_TASK_LABEL="..." DOG_TOOL=claude dog run -- claude "..."
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import json
+import time
+import uuid
+import re
+import select
+import signal
+import subprocess
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+import termios
+import fcntl
+import struct
+
+DASHBOARD_URL = os.environ.get("DOG_DASHBOARD", "http://127.0.0.1:17890")
+HEARTBEAT_INTERVAL = 8.0   # 心跳秒数
+IDLE_TIMEOUT = 12.0        # 多久没输出 → idle/thinking
+ACTION_BUF_LIMIT = 180
+
+# ---------- 输出解析器 ----------
+
+CLAUDE_PATTERNS = [
+    (re.compile(r"^[\s●]*Running.*?:\s*(.+)$"), "正在运行 {0}"),
+    (re.compile(r"^[\s●]*(Reading|Writing|Editing)\s+(.+)$"), "{0} {1}"),
+    (re.compile(r"^[\s●]*(Bash|Edit|Read|Write|Grep|Glob)\((.+)\)\s*$"), "{0} {1}"),
+    (re.compile(r"^[\s●]*(Searching for|Looking up)\s+(.+)$"), "搜索 {1}"),
+    (re.compile(r"Approved tool use:\s*(.+)$"), "已批准 {0}"),
+    (re.compile(r"Tool result:"), "处理工具结果"),
+]
+
+WAITING_PATTERNS = [
+    re.compile(r"\bDo you (want|approve|allow)\b", re.I),
+    re.compile(r"\b\[y/n\]\b", re.I),
+    re.compile(r"\bPress (Enter|Y) to\b", re.I),
+    re.compile(r"\bwaiting for (input|approval)\b", re.I),
+    re.compile(r"❯.*\?$"),
+]
+
+SPINNER_RE = re.compile(r"^[\s⠀-⣿⠁-⠿⡀-⣿◐◓◑◒▁-▇\|/\-\\\.]*$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def detect_waiting(line: str) -> bool:
+    return any(p.search(line) for p in WAITING_PATTERNS)
+
+
+def detect_action(line: str, tool: str) -> str | None:
+    if tool == "claude":
+        for pat, tpl in CLAUDE_PATTERNS:
+            m = pat.search(line)
+            if m:
+                try:
+                    return tpl.format(*m.groups())
+                except Exception:
+                    return tpl
+    # 通用：取首行非空内容
+    clean = line.strip()
+    if not clean:
+        return None
+    if SPINNER_RE.match(clean):
+        return None
+    if len(clean) > ACTION_BUF_LIMIT:
+        clean = clean[:ACTION_BUF_LIMIT] + "…"
+    return clean
+
+
+# ---------- HTTP 客户端 ----------
+
+def post(path: str, body: dict, timeout: float = 1.5) -> dict | None:
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            f"{DASHBOARD_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
+
+
+# ---------- 团队协作子命令 ----------
+
+USAGE = """用法:
+  dog run ["任务描述"] [--] <命令> [参数...]   启动并包装一个 agent
+  dog team                                    查看本项目在岗成员
+  dog send <狗名> "<消息>"                     发消息给队友
+  dog submit "<交付说明>"                      声明交付，进入待验收
+  dog escalate "<病历内容>"                    （质检用）红线上报 PM
+  dog hire <角色> --task "<任务>" [--tool X] [--model Y]   （PM 用）招聘
+"""
+
+
+def self_id():
+    # 在 agent 会话内执行时，wrapper 通过 DOG_SELF_ID 告知身份
+    return os.environ.get("DOG_SELF_ID") or os.environ.get("DOG_AGENT_ID")
+
+
+def cmd_team():
+    project_id = os.environ.get("DOG_PROJECT_ID", "")
+    try:
+        with urllib.request.urlopen(
+            f"{DASHBOARD_URL}/api/team?projectId={urllib.parse.quote(project_id)}", timeout=3
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"查询失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    team = data.get("team", [])
+    if not team:
+        print("（无在岗成员）")
+        return
+    print(f"{'名字':<12}{'角色':<16}{'状态':<12}任务")
+    for a in team:
+        print(f"{a.get('dogName',''):<12}{a.get('role',''):<16}{a.get('status',''):<12}{a.get('taskLabel','')}")
+
+
+def cmd_send(args: list[str]):
+    if len(args) < 2:
+        print('用法: dog send <狗名> "<消息>"', file=sys.stderr)
+        sys.exit(2)
+    target, text = args[0], " ".join(args[1:])
+    body = {
+        "fromAgentId": self_id(),
+        "targetDogName": target,
+        "text": text,
+        "projectId": os.environ.get("DOG_PROJECT_ID"),
+    }
+    resp = post("/api/send", body, timeout=15)
+    if resp and resp.get("ok"):
+        print(f"✓ 已发送给 {target}")
+    else:
+        print(f"✗ 发送失败: {(resp or {}).get('error', '服务器无响应')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_submit(args: list[str]):
+    note = " ".join(args) if args else "已交付"
+    agent_id = self_id()
+    if not agent_id:
+        print("✗ 不在 dog 会话里，无法提交", file=sys.stderr)
+        sys.exit(1)
+    resp = post("/api/events", {
+        "type": "submitted",
+        "agentId": agent_id,
+        "currentAction": f"已交付：{note[:120]}",
+    })
+    if resp and resp.get("ok"):
+        print("✓ 已进入待验收状态。保持在岗，等待质检/PM 的意见。")
+    else:
+        print("✗ 提交失败：dashboard 无响应", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_escalate(args: list[str]):
+    text = " ".join(args)
+    if not text:
+        print('用法: dog escalate "<病历内容>"', file=sys.stderr)
+        sys.exit(2)
+    agent_id = self_id()
+    resp = post("/api/events", {
+        "type": "escalation",
+        "agentId": agent_id or "unknown",
+        "projectId": os.environ.get("DOG_PROJECT_ID"),
+        "messageText": text,
+    }, timeout=15)
+    if resp and resp.get("ok"):
+        print("✓ 已上报 PM" + ("（已直达 PM 终端）" if resp.get("delivered") else "（PM 不在岗，dashboard 已记录）"))
+    else:
+        print("✗ 上报失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_hire(args: list[str]):
+    if not args:
+        print('用法: dog hire <角色> --task "<任务>" [--tool X] [--model Y]', file=sys.stderr)
+        sys.exit(2)
+    role = args[0]
+    task = tool = model = None
+    i = 1
+    while i < len(args):
+        if args[i] == "--task" and i + 1 < len(args):
+            task = args[i + 1]; i += 2
+        elif args[i] == "--tool" and i + 1 < len(args):
+            tool = args[i + 1]; i += 2
+        elif args[i] == "--model" and i + 1 < len(args):
+            model = args[i + 1]; i += 2
+        else:
+            i += 1
+    if not task:
+        print("✗ 缺少 --task", file=sys.stderr)
+        sys.exit(2)
+    resp = post("/api/hire", {
+        "fromAgentId": self_id(),
+        "role": role,
+        "task": task,
+        "tool": tool,
+        "model": model,
+    }, timeout=30)
+    if resp and resp.get("ok"):
+        print(f"✓ 已招聘 {role}，新成员正在入职")
+    else:
+        print(f"✗ 招聘失败: {(resp or {}).get('error', '服务器无响应')}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------- 主流程 ----------
+
+def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """
+    返回 (task_label, agent_id, command_argv)
+    支持:
+      dog run "label" cmd args...
+      dog run -- cmd args...
+      dog run cmd args...   (label = 命令首词)
+    """
+    if not argv or argv[0] != "run":
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
+
+    rest = argv[1:]
+    if not rest:
+        print("缺少要执行的命令", file=sys.stderr)
+        sys.exit(2)
+
+    label = os.environ.get("DOG_TASK_LABEL")
+    agent_id = os.environ.get("DOG_AGENT_ID")
+
+    # -- 分隔符
+    if "--" in rest:
+        i = rest.index("--")
+        head = rest[:i]
+        cmd = rest[i + 1:]
+        if head and not label:
+            label = head[0]
+    else:
+        # 第一个参数看起来像描述（非可执行）就当 label
+        head_first = rest[0]
+        if (
+            not label
+            and not head_first.startswith("-")
+            and " " in head_first  # 多词描述
+        ):
+            label = head_first
+            cmd = rest[1:]
+        else:
+            cmd = rest
+
+    if not cmd:
+        print("没有要执行的命令", file=sys.stderr)
+        sys.exit(2)
+
+    if not label:
+        label = " ".join(cmd[:3])
+
+    return label, agent_id, cmd
+
+
+def main():
+    label, agent_id, cmd = parse_args(sys.argv[1:])
+    if not agent_id:
+        agent_id = str(uuid.uuid4())
+
+    tool = os.environ.get("DOG_TOOL") or guess_tool(cmd[0])
+    dog_name = os.environ.get("DOG_NAME")
+    role = os.environ.get("DOG_ROLE", "fullstack")  # 9 角色 id
+    terminal_app = os.environ.get("DOG_TERMINAL_APP")  # Terminal | iTerm | Warp
+    parent_id = os.environ.get("DOG_PARENT_ID")  # 从父进程继承
+    project_id = os.environ.get("DOG_PROJECT_ID")  # 项目归属
+    # 终端窗口标识：父狗如果有就继承；自己是根狗就用自己 id 短码
+    terminal_marker = os.environ.get("DOG_TERMINAL_MARKER") or agent_id[:8]
+    terminal_tty = os.ttyname(sys.stdin.fileno()) if sys.stdin.isatty() else None
+    is_pm = role in ("pm", "manager")
+
+    # 报告启动
+    started_resp = post(
+        "/api/events",
+        {
+            "type": "started",
+            "agentId": agent_id,
+            "taskLabel": label,
+            "tool": tool,
+            "role": role,
+            "dogName": dog_name,
+            "terminalApp": terminal_app,
+            "parentId": parent_id,
+            "terminalMarker": terminal_marker,
+            "terminalTty": terminal_tty,
+            "cwd": os.getcwd(),
+            "command": " ".join(cmd),
+            "projectId": project_id,
+            "status": "working",
+            "currentAction": "等你说项目目标…" if is_pm else "正在启动…",
+        },
+    )
+    if started_resp:
+        badge = "👔 PM" if is_pm else "🐕"
+        parent_hint = f" (派自 {parent_id[:8]})" if parent_id else ""
+        sys.stderr.write(f"\033[2m{badge} Dog Office: {started_resp.get('dogName','?')} 入职 [{agent_id[:8]}]{parent_hint}\033[0m\n")
+
+    state = {
+        "last_output_ts": time.time(),
+        "running": True,
+        "status": "working",
+        "current_action": "正在启动…",
+    }
+
+    # 准备给子进程的环境变量：
+    # - 清掉 DOG_AGENT_ID（不让子进程误以为自己是我）
+    # - 清掉 DOG_TOOL/DOG_ROLE/DOG_TASK_LABEL/DOG_NAME（这些是我自己的）
+    # - 保留 DOG_TERMINAL_APP（同终端共享，子狗的按钮也能打开同一个窗口）
+    # - 设 DOG_PARENT_ID=<我的 id>（子代孙代狗都能查到他爹）
+    child_env = os.environ.copy()
+    for key in (
+        "DOG_AGENT_ID", "DOG_TOOL", "DOG_ROLE",
+        "DOG_TASK_LABEL", "DOG_NAME"
+    ):
+        child_env.pop(key, None)
+    child_env["DOG_PARENT_ID"] = agent_id
+    child_env["DOG_TERMINAL_MARKER"] = terminal_marker  # 子狗用同一个窗口标记
+    child_env["DOG_SELF_ID"] = agent_id  # 子进程内的 dog 子命令（send/submit）凭这个知道"我是谁"
+    # DOG_PROJECT_ID 不清除，自然继承给子孙
+
+    # === 不动你的终端模式 ===
+    # - 子进程 stdin 直接绑你的终端（要 raw 模式自己调，不经我）
+    # - 我只用 PTY 截子进程的输出，用于显示 + dashboard 解析
+    is_tty = sys.stdin.isatty()
+
+    try:
+        import pty
+        master_fd, slave_fd = pty.openpty()
+
+        # PTY 窗口大小同步父终端（让子进程知道屏幕多大）
+        if is_tty:
+            try:
+                cols, rows = os.get_terminal_size()
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ,
+                            struct.pack('HHHH', rows, cols, 0, 0))
+            except Exception:
+                pass
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=sys.stdin if is_tty else subprocess.PIPE,  # 直接绑你的终端
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            preexec_fn=os.setsid,
+            env=child_env,
+        )
+        os.close(slave_fd)
+
+    except Exception:
+        # 退化：没 PTY 直接 PIPE
+        master_fd = None
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+            env=child_env,
+        )
+
+    # 窗口大小变化 → 通知子进程 PTY（让 TUI 重排）
+    def on_winch(_signum, _frame):
+        if master_fd is None or not is_tty:
+            return
+        try:
+            cols, rows = os.get_terminal_size()
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack('HHHH', rows, cols, 0, 0))
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGWINCH, on_winch)
+
+    # 注册 wrapper 自己的 PID（杀我会触发信号转发到子进程，并跑 finally 清理）
+    post("/api/register-pid", {"agentId": agent_id, "pid": os.getpid()})
+
+    # 信号转发：把信号传给子进程组
+    def forward_signal(signum, _frame):
+        try:
+            os.killpg(os.getpgid(proc.pid), signum)
+        except Exception:
+            pass
+
+    # SIGHUP（终端关闭）→ 跑清理 + 退出
+    def graceful_exit_sighup(signum, _frame):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+        # SystemExit 会触发 finally 块跑清理
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, forward_signal)
+    signal.signal(signal.SIGTERM, forward_signal)
+    signal.signal(signal.SIGHUP, graceful_exit_sighup)
+
+    # 心跳线程
+    def heartbeat():
+        while state["running"]:
+            time.sleep(HEARTBEAT_INTERVAL)
+            now = time.time()
+            # 长时间无输出 → thinking
+            if state["status"] == "working" and now - state["last_output_ts"] > IDLE_TIMEOUT:
+                state["status"] = "thinking"
+                post("/api/events", {
+                    "type": "status",
+                    "agentId": agent_id,
+                    "status": "thinking",
+                    "currentAction": state["current_action"] or "思考中…"
+                })
+            post("/api/events", {"type": "heartbeat", "agentId": agent_id})
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    # 输出读取
+    buf = b""
+    line_count = 0
+
+    def emit_line(line: str):
+        # 完整版：写到 stdout + 解析（用于退化路径）
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        emit_line_parse_only(line)
+
+    def emit_line_parse_only(line: str):
+        # 仅解析，不写 stdout（PTY 路径已经把原始 chunk 写过了）
+        nonlocal line_count
+        line_count += 1
+        clean = strip_ansi(line).rstrip("\n\r")
+
+        if not clean.strip():
+            return
+
+        # 日志
+        level = "tool" if clean.startswith(("●", "Running", "Bash(", "Edit(", "Read(")) else "info"
+        post("/api/events", {
+            "type": "log",
+            "agentId": agent_id,
+            "log": {"level": level, "content": clean[:600]}
+        })
+
+        # 等待输入检测
+        if detect_waiting(clean):
+            state["status"] = "waiting"
+            post("/api/events", {
+                "type": "waiting",
+                "agentId": agent_id,
+                "status": "waiting",
+                "currentAction": clean[:ACTION_BUF_LIMIT]
+            })
+            return
+
+        # 状态恢复 + 当前动作
+        action = detect_action(clean, tool)
+        if action:
+            state["current_action"] = action
+            state["last_output_ts"] = time.time()
+            new_status = "working" if state["status"] in ("thinking", "waiting", "idle") else state["status"]
+            state["status"] = new_status
+            post("/api/events", {
+                "type": "status",
+                "agentId": agent_id,
+                "status": new_status,
+                "currentAction": action,
+                "progress": min(0.95, line_count / 200.0)
+            })
+
+    # 主循环：只读子进程输出，不动 stdin（你的终端原样工作）
+    try:
+        if master_fd is not None:
+            while True:
+                try:
+                    rs, _, _ = select.select([master_fd], [], [], 0.5)
+                except (OSError, ValueError):
+                    break
+
+                if master_fd in rs:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    # 原始字节透传给你的终端
+                    try:
+                        os.write(sys.stdout.fileno(), chunk)
+                    except OSError:
+                        pass
+                    # 缓冲按行解析给 dashboard
+                    buf += chunk
+                    while b"\n" in buf:
+                        line_bytes, buf = buf.split(b"\n", 1)
+                        try:
+                            line = line_bytes.decode("utf-8", errors="replace")
+                        except Exception:
+                            line = line_bytes.decode("latin-1", errors="replace")
+                        emit_line_parse_only(line)
+
+                if proc.poll() is not None and not (rs and master_fd in rs):
+                    break
+        else:
+            assert proc.stdout
+            for line in iter(proc.stdout.readline, ""):
+                emit_line(line)
+    finally:
+        state["running"] = False
+        rc = proc.wait()
+        # flush 残留
+        if buf:
+            try:
+                emit_line(buf.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+
+        if rc == 0:
+            post("/api/events", {
+                "type": "completed",
+                "agentId": agent_id,
+                "status": "done",
+                "currentAction": "完成 ✓",
+                "progress": 1.0
+            })
+            sys.stderr.write(f"\033[2m🐕 Dog Office: 任务完成 ✓\033[0m\n")
+        else:
+            post("/api/events", {
+                "type": "error",
+                "agentId": agent_id,
+                "status": "error",
+                "currentAction": f"退出码 {rc}",
+            })
+            sys.stderr.write(f"\033[2m🐕 Dog Office: 任务出错 (exit {rc})\033[0m\n")
+
+        sys.exit(rc)
+
+
+def guess_tool(cmd: str) -> str:
+    base = os.path.basename(cmd).lower()
+    for k in ("claude", "codex", "antigravity", "anti-gravity", "hermes"):
+        if k in base:
+            return k.replace("anti-gravity", "antigravity")
+    return base or "custom"
+
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    sub = argv[0] if argv else ""
+    if sub == "team":
+        cmd_team()
+    elif sub == "send":
+        cmd_send(argv[1:])
+    elif sub == "submit":
+        cmd_submit(argv[1:])
+    elif sub == "escalate":
+        cmd_escalate(argv[1:])
+    elif sub == "hire":
+        cmd_hire(argv[1:])
+    elif sub == "run":
+        main()
+    else:
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)

@@ -1,0 +1,45 @@
+appId: com.trystan.pawpilot
+productName: PawPilot
+copyright: Copyright © 2026 trystan
+
+directories:
+  output: dist-app
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+  - "!**/node_modules/**/{CHANGELOG.md,README.md,README,readme.md,readme,test,__tests__,tests,powered-test,example,examples}"
+
+# 把 dog 脚本和提示词放到 .app/Contents/Resources 下，方便运行时读取
+extraResources:
+  - from: sdk
+    to: sdk
+    filter: ["**/*"]
+  - from: resources
+    to: resources
+    filter: ["**/*"]
+
+asar: true
+asarUnpack:
+  - "**/node_modules/better-sqlite3/**/*"  # 原生模块不能打进 asar
+
+mac:
+  category: public.app-category.developer-tools
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  identity: null  # 不签名（你自用没问题，首次启动右键打开）
+  target:
+    - target: dmg
+      arch: [arm64]   # Apple Silicon
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+dmg:
+  title: PawPilot
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
