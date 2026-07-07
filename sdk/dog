@@ -76,6 +76,20 @@ def detect_auth_fail(line: str) -> bool:
     return any(p.search(line) for p in AUTH_FAIL_PATTERNS)
 
 
+# 代理/地区拦截：国内直连 Anthropic 常见 403 Request not allowed。
+# 这不是登录问题，应该明确提示检查 Clash/代理透传。
+PROXY_FAIL_PATTERNS = [
+    re.compile(r"403\s+Request not allowed", re.I),
+    re.compile(r"Request not allowed", re.I),
+    re.compile(r"country|region|geograph", re.I),
+    re.compile(r"unsupported location", re.I),
+]
+
+
+def detect_proxy_fail(line: str) -> bool:
+    return any(p.search(line) for p in PROXY_FAIL_PATTERNS)
+
+
 # 用量上限暂停：claude/Pro 额度用尽。识别出来标"⏸ 等额度"而非 lost，让狗挂着等额度恢复后续接，
 # 而不是被当掉线丢掉。
 USAGE_LIMIT_PATTERNS = [
@@ -867,6 +881,22 @@ def main():
                     "type": "log", "agentId": agent_id,
                     "log": {"level": "warn",
                             "content": "⏸ 用量上限暂停：等额度恢复后在详情面板点「继续」续接。原文：" + clean[:120]},
+                })
+            return
+
+        # 0b) 代理/地区拦截（常见 403 Request not allowed）：明确标成代理问题，别误导成未登录
+        if detect_proxy_fail(clean):
+            state["status"] = "error"
+            if state["last_logged"] != "PROXYFAIL":
+                state["last_logged"] = "PROXYFAIL"
+                post("/api/events", {
+                    "type": "status", "agentId": agent_id, "status": "error",
+                    "currentAction": "🌐 代理/地区拦截：检查 ~/.dog-office/proxy.env 或 Clash 7890",
+                })
+                post("/api/events", {
+                    "type": "log", "agentId": agent_id,
+                    "log": {"level": "error",
+                            "content": "🌐 代理/地区拦截：模型服务拒绝当前网络，检查代理透传。原文：" + clean[:120]},
                 })
             return
 

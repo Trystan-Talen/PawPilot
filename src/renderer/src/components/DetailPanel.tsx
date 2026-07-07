@@ -12,7 +12,8 @@ const STATUS_LABEL: Record<string, string> = {
   error: '出错',
   waiting: '等回应',
   lost: '失联',
-  interrupted: '已中断'
+  interrupted: '已中断',
+  paused: '等额度'
 }
 
 const STATUS_DOT: Record<string, string> = {
@@ -24,7 +25,8 @@ const STATUS_DOT: Record<string, string> = {
   error: '#ef4444',
   waiting: '#f59e0b',
   lost: '#9aa0a8',
-  interrupted: '#f97316'
+  interrupted: '#f97316',
+  paused: '#eab308'
 }
 
 export function DetailPanel() {
