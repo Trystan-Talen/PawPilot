@@ -37,6 +37,8 @@ const TOOLS = [
 ] as const
 
 const TERMINALS = ['Terminal', 'iTerm', 'Warp'] as const
+const PREFLIGHT_TIMEOUT_MS = 8000
+const HIRE_TIMEOUT_MS = 18000
 
 export function HireModal() {
   const open = useAgentStore((s) => s.hireOpen)
@@ -89,6 +91,7 @@ export function HireModal() {
 
   async function submit() {
     setErr('')
+    setPreflight([])
     if (tool !== 'custom' && !taskLabel.trim()) {
       setErr(isPm ? '项目目标不能为空' : '任务描述不能为空')
       return
@@ -109,24 +112,36 @@ export function HireModal() {
       projectId: currentProjectId,
       projectDir: currentProject?.dir ?? null
     }
-    const checked = await window.dog.preflightHire(payload)
-    setPreflight(checked.checks ?? [])
-    if (!checked.ok) {
-      setSubmitting(false)
-      setErr('预检未通过，先处理红色项再招聘')
-      return
-    }
+    try {
+      const checked = await withTimeout(
+        window.dog.preflightHire(payload),
+        PREFLIGHT_TIMEOUT_MS,
+        '预检超时：主进程没有及时返回，请确认 PawPilot 没有卡住'
+      )
+      setPreflight(checked.checks ?? [])
+      if (!checked.ok) {
+        setErr('预检未通过，先处理红色项再招聘')
+        return
+      }
 
-    const res = await window.dog.hireAgent(payload)
-    setSubmitting(false)
-    if (!res.ok) {
-      setErr(res.error ?? '失败')
-      return
+      const res = await withTimeout(
+        window.dog.hireAgent(payload),
+        HIRE_TIMEOUT_MS,
+        '招聘超时：终端启动脚本没有及时返回，请检查 Terminal/iTerm/Warp 是否弹窗或卡住'
+      )
+      if (!res.ok) {
+        setErr(res.error ?? '失败')
+        return
+      }
+      setTaskLabel('')
+      setCustomCommand('')
+      setPreflight([])
+      setOpen(false)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSubmitting(false)
     }
-    setTaskLabel('')
-    setCustomCommand('')
-    setPreflight([])
-    setOpen(false)
   }
 
   const accent = isPm ? '#f59e0b' : '#4db6ff'
@@ -139,40 +154,42 @@ export function HireModal() {
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-lg rounded-2xl p-6 max-h-[88vh] overflow-y-auto"
+        className="w-full max-w-lg rounded-2xl overflow-hidden flex flex-col"
         style={{
+          maxHeight: '88vh',
           background: 'linear-gradient(180deg, rgba(28,34,45,0.98), rgba(14,18,26,0.98))',
           border: '1px solid rgba(255,215,156,0.16)',
           boxShadow: '0 34px 90px -22px rgba(0,0,0,0.75), inset 0 1px rgba(255,255,255,0.12)'
         }}
       >
-        {/* 头部 */}
-        <div className="flex items-center gap-3 mb-4">
-          <div
-            className="flex items-center justify-center rounded-lg"
-            style={{
-              width: 40,
-              height: 40,
-              background: isPm
-                ? 'linear-gradient(135deg, #ffd58a 0%, #f59e0b 100%)'
-                : 'linear-gradient(135deg, #4db6ff 0%, #8b8ff6 100%)',
-              boxShadow: `0 0 28px ${accent}60, inset 0 1px rgba(255,255,255,0.35)`
-            }}
-          >
-            <span style={{ fontSize: 20 }}>{role?.emoji ?? '🐕'}</span>
-          </div>
-          <div className="min-w-0">
-            <div className="font-semibold text-base" style={{ color: '#fff7e8' }}>
-              招聘 · {role?.name ?? '成员'}
+        <div className="overflow-y-auto p-6 min-h-0">
+          {/* 头部 */}
+          <div className="flex items-center gap-3 mb-4">
+            <div
+              className="flex items-center justify-center rounded-lg"
+              style={{
+                width: 40,
+                height: 40,
+                background: isPm
+                  ? 'linear-gradient(135deg, #ffd58a 0%, #f59e0b 100%)'
+                  : 'linear-gradient(135deg, #4db6ff 0%, #8b8ff6 100%)',
+                boxShadow: `0 0 28px ${accent}60, inset 0 1px rgba(255,255,255,0.35)`
+              }}
+            >
+              <span style={{ fontSize: 20 }}>{role?.emoji ?? '🐕'}</span>
             </div>
-            <div className="text-[11px] truncate" style={{ color: 'rgba(255,247,232,0.56)' }}>
-              {currentProject ? `项目：${currentProject.name}` : '快速监控（不归属任何项目）'}
+            <div className="min-w-0">
+              <div className="font-semibold text-base" style={{ color: '#fff7e8' }}>
+                招聘 · {role?.name ?? '成员'}
+              </div>
+              <div className="text-[11px] truncate" style={{ color: 'rgba(255,247,232,0.56)' }}>
+                {currentProject ? `项目：${currentProject.name}` : '快速监控（不归属任何项目）'}
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* 角色选择（按 核心/质量/专才 分组） */}
-        <div className="mb-4">
+          {/* 角色选择（按 核心/质量/专才 分组） */}
+          <div className="mb-4">
           {GROUP_ORDER.map((g) => {
             const groupRoles = roles.filter((r) => (r.group ?? 'specialist') === g)
             if (groupRoles.length === 0) return null
@@ -413,6 +430,7 @@ export function HireModal() {
             {submitting ? '招聘中…' : isPm ? '入职' : '开始干活'}
           </button>
         </div>
+        </div>
       </div>
     </div>
   )
@@ -428,4 +446,20 @@ function levelColor(level: PreflightCheck['level']) {
   if (level === 'error') return '#fca5a5'
   if (level === 'warn') return '#fbbf24'
   return '#86efac'
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        window.clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
 }

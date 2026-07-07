@@ -8,6 +8,7 @@ import { app } from 'electron'
 import net from 'net'
 
 const execAsync = promisify(exec)
+const APPLESCRIPT_TIMEOUT_MS = 15_000
 
 // 消息直连：dog wrapper 为每个 agent 在 /tmp/dogoffice-ipc/<agentId>.sock 开一个 Unix socket。
 // 往里写一行 JSON {text} 就会被 wrapper 注入到 agent 的 PTY（等价于在它终端里打字+回车），
@@ -595,7 +596,7 @@ tell application "System Events" to key code 36`
 end tell`
 
   try {
-    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`)
+    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: APPLESCRIPT_TIMEOUT_MS })
     return { ok: true }
   } catch (e) {
     return { ok: false, error: extractAppleScriptError(e) }
@@ -741,7 +742,7 @@ try
 end try`
 
   try {
-    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`)
+    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: APPLESCRIPT_TIMEOUT_MS })
     return { ok: true }
   } catch (e) {
     return { ok: false, error: extractAppleScriptError(e) }
@@ -806,7 +807,7 @@ end tell`
   }
 
   try {
-    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`)
+    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: APPLESCRIPT_TIMEOUT_MS })
     return { ok: true }
   } catch (e) {
     return { ok: false, error: extractAppleScriptError(e) }
