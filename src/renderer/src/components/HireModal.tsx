@@ -14,6 +14,13 @@ interface RoleSpec {
   isPm: boolean
 }
 
+interface PreflightCheck {
+  id: string
+  label: string
+  level: 'ok' | 'warn' | 'error'
+  message: string
+}
+
 const GROUP_ORDER: RoleGroup[] = ['core', 'quality', 'specialist']
 const GROUP_LABEL: Record<RoleGroup, string> = {
   core: '核心 · 多数项目就这几个',
@@ -48,6 +55,7 @@ export function HireModal() {
   const [terminal, setTerminal] = useState<(typeof TERMINALS)[number]>('Terminal')
   const [submitting, setSubmitting] = useState(false)
   const [err, setErr] = useState('')
+  const [preflight, setPreflight] = useState<PreflightCheck[]>([])
 
   // 加载角色注册表
   useEffect(() => {
@@ -91,7 +99,7 @@ export function HireModal() {
     }
 
     setSubmitting(true)
-    const res = await window.dog.hireAgent({
+    const payload = {
       role: roleId,
       tool: tool as any,
       model: model.trim() || null,
@@ -100,7 +108,16 @@ export function HireModal() {
       terminal,
       projectId: currentProjectId,
       projectDir: currentProject?.dir ?? null
-    })
+    }
+    const checked = await window.dog.preflightHire(payload)
+    setPreflight(checked.checks ?? [])
+    if (!checked.ok) {
+      setSubmitting(false)
+      setErr('预检未通过，先处理红色项再招聘')
+      return
+    }
+
+    const res = await window.dog.hireAgent(payload)
     setSubmitting(false)
     if (!res.ok) {
       setErr(res.error ?? '失败')
@@ -108,6 +125,7 @@ export function HireModal() {
     }
     setTaskLabel('')
     setCustomCommand('')
+    setPreflight([])
     setOpen(false)
   }
 
@@ -326,6 +344,51 @@ export function HireModal() {
           </div>
         )}
 
+        {preflight.length > 0 && (
+          <div
+            className="mb-4 rounded-lg overflow-hidden"
+            style={{
+              background: 'rgba(255,255,255,0.055)',
+              border: '1px solid rgba(255,255,255,0.09)'
+            }}
+          >
+            <div
+              className="px-3 py-2 text-[10px] tracking-widest uppercase flex items-center justify-between"
+              style={{ color: 'rgba(255,247,232,0.5)', borderBottom: '1px solid rgba(255,255,255,0.07)' }}
+            >
+              <span>招聘前预检</span>
+              <span style={{ color: preflight.some((c) => c.level === 'error') ? '#fca5a5' : '#86efac' }}>
+                {preflight.some((c) => c.level === 'error') ? '需处理' : '可启动'}
+              </span>
+            </div>
+            <div className="p-2 space-y-1">
+              {preflight.map((c) => (
+                <div
+                  key={c.id}
+                  className="grid gap-2 rounded-md px-2.5 py-2"
+                  style={{
+                    gridTemplateColumns: '76px 1fr',
+                    background:
+                      c.level === 'error' ? 'rgba(239,68,68,0.12)' :
+                      c.level === 'warn' ? 'rgba(245,158,11,0.12)' :
+                      'rgba(34,197,94,0.1)'
+                  }}
+                >
+                  <div className="text-[11px] font-semibold" style={{ color: levelColor(c.level) }}>
+                    {levelLabel(c.level)}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-medium" style={{ color: '#fff7e8' }}>{c.label}</div>
+                    <div className="text-[10.5px] leading-relaxed break-words" style={{ color: 'rgba(255,247,232,0.58)' }}>
+                      {c.message}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="flex justify-end gap-2">
           <button
             onClick={() => setOpen(false)}
@@ -353,4 +416,16 @@ export function HireModal() {
       </div>
     </div>
   )
+}
+
+function levelLabel(level: PreflightCheck['level']) {
+  if (level === 'error') return '错误'
+  if (level === 'warn') return '提醒'
+  return '通过'
+}
+
+function levelColor(level: PreflightCheck['level']) {
+  if (level === 'error') return '#fca5a5'
+  if (level === 'warn') return '#fbbf24'
+  return '#86efac'
 }

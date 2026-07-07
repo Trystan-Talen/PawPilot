@@ -10,6 +10,25 @@ export interface DogApi {
     projectDir?: string | null
     parentId?: string | null
   }) => Promise<{ ok: boolean; agentId?: string; role?: string; error?: string }>
+  preflightHire: (payload: {
+    role?: string
+    tool: 'claude' | 'codex' | 'antigravity' | 'hermes' | 'custom'
+    model?: string | null
+    taskLabel: string
+    customCommand?: string
+    terminal?: 'Terminal' | 'iTerm' | 'Warp'
+    projectId?: string | null
+    projectDir?: string | null
+    parentId?: string | null
+  }) => Promise<{
+    ok: boolean
+    checks: {
+      id: string
+      label: string
+      level: 'ok' | 'warn' | 'error'
+      message: string
+    }[]
+  }>
   focusTerminal: (args: {
     agentId: string
     terminalApp: string | null

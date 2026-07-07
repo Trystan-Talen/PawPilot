@@ -1,7 +1,7 @@
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import { randomUUID } from 'crypto'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import { app } from 'electron'
@@ -258,6 +258,20 @@ export interface HirePayload {
   parentId?: string | null      // PM 派活时传自己的 id
 }
 
+export type PreflightLevel = 'ok' | 'warn' | 'error'
+
+export interface PreflightCheck {
+  id: string
+  label: string
+  level: PreflightLevel
+  message: string
+}
+
+export interface PreflightResult {
+  ok: boolean
+  checks: PreflightCheck[]
+}
+
 function escape(s: string) {
   return s.replace(/"/g, '\\"')
 }
@@ -268,6 +282,26 @@ function appleString(s: string) {
 
 function shellEscape(p: string) {
   return `'${p.replace(/'/g, `'\\''`)}'`
+}
+
+async function commandExists(binary: string): Promise<boolean> {
+  if (!binary) return false
+  if (!/^[\w@%+=:,./-]+$/.test(binary)) return false
+  if (binary.includes('/')) {
+    try {
+      accessSync(binary, constants.X_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+  try {
+    // Use a login shell so the check is close to what Terminal.app users expect from their PATH.
+    await execAsync(`/bin/bash -lc ${shellEscape(`command -v ${binary}`)}`, { timeout: 5000 })
+    return true
+  } catch {
+    return false
+  }
 }
 
 function markerOf(agentId: string) {
@@ -348,6 +382,84 @@ function buildToolCommand(
   }
   // antigravity 等其他：best-effort 裸起 + 注入
   return { command: `${tool}${modelFlag}`, initPrompt }
+}
+
+export async function preflightHire(payload: HirePayload): Promise<PreflightResult> {
+  const checks: PreflightCheck[] = []
+  const add = (id: string, label: string, level: PreflightLevel, message: string) => {
+    checks.push({ id, label, level, message })
+  }
+
+  try {
+    const dogBin = resolveDogBin()
+    if (dogBin.includes('/')) {
+      accessSync(dogBin, constants.X_OK)
+    }
+    add('dog-bin', 'dog wrapper', 'ok', `可用：${dogBin}`)
+  } catch (e) {
+    add('dog-bin', 'dog wrapper', 'error', `dog wrapper 安装/权限异常：${extractAppleScriptError(e)}`)
+  }
+
+  const roleId = payload.role ?? 'fullstack'
+  const spec = getRole(roleId)
+  if (!spec) {
+    add('role', '角色配置', 'error', `未知角色：${roleId}`)
+  } else {
+    const promptPath = ensureRolePrompt(roleId)
+    if (promptPath) {
+      add('role', '角色配置', 'ok', `${spec.name} prompt 已生成`)
+    } else {
+      add('role', '角色配置', 'error', `${spec.name} 的角色 prompt 找不到或生成失败`)
+    }
+  }
+
+  if (payload.projectDir) {
+    try {
+      accessSync(payload.projectDir, constants.R_OK | constants.W_OK)
+      add('project-dir', '项目目录', 'ok', `可读写：${payload.projectDir}`)
+    } catch {
+      add('project-dir', '项目目录', 'error', `目录不可读写或不存在：${payload.projectDir}`)
+    }
+  } else {
+    add('project-dir', '项目目录', 'warn', '当前是快速监控区，新狗不会归属任何项目')
+  }
+
+  if (payload.tool === 'custom') {
+    const first = payload.customCommand?.trim().split(/\s+/)[0] ?? ''
+    if (!first) {
+      add('tool', '启动命令', 'error', '自定义命令为空')
+    } else if (await commandExists(first)) {
+      add('tool', '启动命令', 'ok', `可找到命令：${first}`)
+    } else {
+      add('tool', '启动命令', 'warn', `无法在登录 shell PATH 中确认 ${first}，仍可尝试启动`)
+    }
+  } else if (await commandExists(payload.tool)) {
+    add('tool', 'Agent 工具', 'ok', `可找到命令：${payload.tool}`)
+  } else {
+    add('tool', 'Agent 工具', 'error', `找不到 ${payload.tool}，请确认它已安装且在登录 shell PATH 中`)
+  }
+
+  if (payload.tool === 'claude') {
+    if (existsSync(CLAUDE_CFG_DIR)) {
+      add('claude-config', 'Claude 配置', 'ok', `独立配置目录存在：${CLAUDE_CFG_DIR}`)
+    } else {
+      add(
+        'claude-config',
+        'Claude 配置',
+        'warn',
+        `独立配置目录不存在；首次使用需运行 CLAUDE_CONFIG_DIR=${CLAUDE_CFG_DIR} claude 后 /login`
+      )
+    }
+
+    const proxyExports = resolveProxyExports()
+    if (proxyExports.length > 0) {
+      add('proxy', '代理透传', 'ok', '检测到代理配置，新狗启动脚本会自动继承')
+    } else {
+      add('proxy', '代理透传', 'warn', '未检测到代理配置；国内网络下 Claude 可能 403')
+    }
+  }
+
+  return { ok: !checks.some((c) => c.level === 'error'), checks }
 }
 
 export async function openInTerminal(payload: HirePayload) {

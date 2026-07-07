@@ -4,7 +4,7 @@ import { existsSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { startServer } from './server'
 import { initDatabase } from './db'
-import { openInTerminal, focusTerminal, sendToTerminal, resolveDogBin } from './terminal'
+import { openInTerminal, focusTerminal, sendToTerminal, resolveDogBin, preflightHire } from './terminal'
 import { ROLES } from './roles'
 
 let mainWindow: BrowserWindow | null = null
@@ -142,6 +142,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('hire-agent', async (_e, payload) => {
     return openInTerminal(payload)
+  })
+
+  ipcMain.handle('preflight-hire', async (_e, payload) => {
+    return preflightHire(payload)
   })
 
   ipcMain.handle('focus-terminal', async (_e, args) => {

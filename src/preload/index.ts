@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 const api = {
   hireAgent: (payload: any) => ipcRenderer.invoke('hire-agent', payload),
+  preflightHire: (payload: any) => ipcRenderer.invoke('preflight-hire', payload),
   focusTerminal: (args: {
     agentId: string
     terminalApp: string | null
