@@ -5,9 +5,11 @@
 - Modal shells own the visual frame: background, border, shadow, radius, and clipping.
 - Scroll must live in an inner child, not on the rounded shell itself.
 - Use this structure for tall dialogs:
-  - outer shell: `rounded-* overflow-hidden flex flex-col max-height`
+  - outer shell: `rounded-* overflow-hidden flex flex-col max-height padding`
   - inner body: `overflow-y-auto min-h-0 padding`
-- This prevents scrolling content and overlay scrollbars from visually breaking through the top or bottom rounded corners.
+- Leave an 8px visual inset between the rounded shell and the scroll container. The scrollbar should start and end inside this inset, not touch the modal's curved top or bottom edge.
+- Give the scroll body at least 16px of top and bottom padding, plus `scroll-padding-block`, so content feels like it stops before the frame instead of crashing into it.
+- This is not only a clipping fix. The safe inset makes tall dialogs feel calmer and prevents both content and overlay scrollbars from visually fighting the rounded corners.
 
 ## Async Actions
 

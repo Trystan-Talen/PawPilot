@@ -151,10 +151,10 @@ export function HireModal() {
       onClick={() => setOpen(false)}
       className="fixed inset-0 z-50 flex items-center justify-center p-6"
       style={{ background: 'rgba(3,5,9,0.66)', backdropFilter: 'blur(10px)' }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-lg rounded-2xl overflow-hidden flex flex-col"
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-lg rounded-2xl overflow-hidden flex flex-col p-2"
         style={{
           maxHeight: '88vh',
           background: 'linear-gradient(180deg, rgba(28,34,45,0.98), rgba(14,18,26,0.98))',
@@ -162,7 +162,14 @@ export function HireModal() {
           boxShadow: '0 34px 90px -22px rgba(0,0,0,0.75), inset 0 1px rgba(255,255,255,0.12)'
         }}
       >
-        <div className="overflow-y-auto p-6 min-h-0">
+        <div
+          className="overflow-y-auto min-h-0 px-4 py-4"
+          style={{
+            borderRadius: 12,
+            scrollbarGutter: 'stable',
+            scrollPaddingBlock: 16
+          }}
+        >
           {/* 头部 */}
           <div className="flex items-center gap-3 mb-4">
             <div
