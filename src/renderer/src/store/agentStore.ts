@@ -1,21 +1,26 @@
 import { create } from 'zustand'
-import type { Agent, AgentStatus } from '@/types/agent'
+import type { Agent, AgentStatus, Project } from '@/types/agent'
 
 interface State {
   agents: Record<string, Agent>
   archived: Agent[]
+  projects: Project[]
+  currentProjectId: string | null   // null = "快速监控"（无项目归属的临时 agent）
   walkingOut: Set<string>
   selectedId: string | null
   focusedId: string | null  // 点击聚焦的 agent（高亮它和它的关系网）
   hireOpen: boolean
-  hireInitialRole: 'manager' | 'worker'
+  hireInitialRole: string
   archiveOpen: boolean
   setAgents: (rows: Agent[]) => void
   setArchived: (rows: Agent[]) => void
+  setProjects: (rows: Project[]) => void
+  addProject: (p: Project) => void
+  selectProject: (id: string | null) => void
   applyEvent: (e: any) => void
   select: (id: string | null) => void
   focus: (id: string | null) => void
-  openHire: (open: boolean, initialRole?: 'manager' | 'worker') => void
+  openHire: (open: boolean, initialRole?: string) => void
   openArchive: (open: boolean) => void
   startWalkOut: (id: string) => void
   finishWalkOut: (id: string) => void
@@ -24,11 +29,13 @@ interface State {
 export const useAgentStore = create<State>((set, get) => ({
   agents: {},
   archived: [],
+  projects: [],
+  currentProjectId: null,
   walkingOut: new Set(),
   selectedId: null,
   focusedId: null,
   hireOpen: false,
-  hireInitialRole: 'worker',
+  hireInitialRole: 'pm',
   archiveOpen: false,
 
   setAgents: (rows) => {
@@ -38,6 +45,16 @@ export const useAgentStore = create<State>((set, get) => ({
   },
 
   setArchived: (rows) => set({ archived: rows }),
+
+  setProjects: (rows) => set({ projects: rows }),
+
+  addProject: (p) =>
+    set((s) => ({
+      projects: [p, ...s.projects.filter((x) => x.id !== p.id)],
+      currentProjectId: p.id
+    })),
+
+  selectProject: (id) => set({ currentProjectId: id }),
 
   applyEvent: (e) => {
     const { agents } = get()
@@ -74,6 +91,19 @@ export const useAgentStore = create<State>((set, get) => ({
       return
     }
 
+    // PM 求助：点亮举手信号（瞬态，不改 status），老板看一眼即清除
+    if (e.type === 'help_request') {
+      const cur = agents[id]
+      if (!cur) return
+      set({
+        agents: {
+          ...agents,
+          [id]: { ...cur, helpRequest: true, helpText: e.messageText ?? '', updatedAt: Date.now() }
+        }
+      })
+      return
+    }
+
     const cur = agents[id]
     if (!cur) return
     const next: Agent = { ...cur, updatedAt: Date.now() }
@@ -100,10 +130,20 @@ export const useAgentStore = create<State>((set, get) => ({
     set({ agents: { ...agents, [id]: next } })
   },
 
-  select: (id) => set({ selectedId: id }),
+  select: (id) => {
+    // 老板查看某只狗 → 清除它的求助信号（已被看见）
+    if (id) {
+      const { agents } = get()
+      const a = agents[id]
+      if (a?.helpRequest) {
+        set({ agents: { ...agents, [id]: { ...a, helpRequest: false } } })
+      }
+    }
+    set({ selectedId: id })
+  },
   focus: (id) => set({ focusedId: id }),
   openHire: (open, initialRole) =>
-    set({ hireOpen: open, hireInitialRole: initialRole ?? 'worker' }),
+    set({ hireOpen: open, hireInitialRole: initialRole ?? 'pm' }),
   openArchive: (open) => set({ archiveOpen: open }),
 
   startWalkOut: (id) => {

@@ -112,6 +112,29 @@
   opacity: 1;
 }
 
+/* PM 求助：金色脉冲光晕（不放大狗，只靠光晕+举手收拢注意力） */
+.station-shell.is-helping::after {
+  content: "";
+  position: absolute;
+  inset: 4% 0 10%;
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(245, 185, 66, 0.42), transparent 62%);
+  filter: blur(14px);
+  opacity: 0.85;
+  z-index: -1;
+  pointer-events: none;
+  animation: help-halo 1.5s ease-in-out infinite;
+}
+@keyframes help-halo {
+  0%, 100% { opacity: 0.45; transform: scale(0.97); }
+  50% { opacity: 0.95; transform: scale(1.04); }
+}
+@keyframes paw-wave {
+  0%, 100% { transform: rotate(-14deg); }
+  50% { transform: rotate(16deg); }
+}
+
 .workstation-svg {
   filter: drop-shadow(0 22px 20px rgba(0, 0, 0, 0.34));
 }

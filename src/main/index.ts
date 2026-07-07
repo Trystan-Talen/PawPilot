@@ -4,7 +4,7 @@ import { existsSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { startServer } from './server'
 import { initDatabase } from './db'
-import { openInTerminal, focusTerminal, sendToTerminal } from './terminal'
+import { openInTerminal, focusTerminal, sendToTerminal, resolveDogBin } from './terminal'
 import { ROLES } from './roles'
 
 let mainWindow: BrowserWindow | null = null
@@ -83,6 +83,13 @@ if (!gotLock) {
 app.whenReady().then(async () => {
   if (!gotLock) return
   const db = await initDatabase()
+  // 启动时就把 dog 脚本装到 home 下的非保护目录（绕开 ~/Desktop 等目录的 macOS TCC 限制）
+  try {
+    const dogPath = resolveDogBin()
+    console.log(`[dog-office] dog installed at ${dogPath}`)
+  } catch (e) {
+    console.error('[dog-office] dog install failed', e)
+  }
   const interrupted = db.markStaleAgentsInterrupted(Date.now())
   if (interrupted.length > 0) {
     console.log(`[dog-office] marked ${interrupted.length} stale agents interrupted`)
@@ -94,24 +101,34 @@ app.whenReady().then(async () => {
       mainWindow.webContents.send('agent-event', event)
     }
 
-    const notifiable = ['completed', 'error', 'waiting']
-    if (!notifiable.includes(event.type)) return
+    // 撞额度暂停：以 status 事件形式到达，单独识别
+    const isPaused = event.type === 'status' && event.status === 'paused'
+    const notifiable = ['completed', 'error', 'waiting', 'help_request']
+    if (!isPaused && !notifiable.includes(event.type)) return
 
-    // 同一 agent 同一类型只通知一次（避免重复弹窗）
-    if (lastNotifiedType.get(event.agentId) === event.type) return
-    lastNotifiedType.set(event.agentId, event.type)
+    // 去重 key：暂停用 paused，其余用事件类型；PM 求助每次都通知不去重
+    const dedupKey = isPaused ? 'paused' : event.type
+    if (event.type !== 'help_request') {
+      if (lastNotifiedType.get(event.agentId) === dedupKey) return
+      lastNotifiedType.set(event.agentId, dedupKey)
+    }
 
     const title =
+      isPaused ? '⏸ 额度暂停' :
       event.type === 'completed' ? '✅ 任务完成' :
       event.type === 'error' ? '⛔️ 任务报错' :
+      event.type === 'help_request' ? '🙋 PM 找你' :
       '⏳ 在等你回应'
 
-    const body = `${event.dogName ?? 'Agent'} · ${event.taskLabel ?? ''}`
+    const body =
+      event.type === 'help_request'
+        ? `${event.dogName ?? 'PM'}：${event.messageText ?? '需要你的指示'}`
+        : `${event.dogName ?? 'Agent'} · ${event.taskLabel ?? ''}`
 
     const n = new Notification({
       title,
       body,
-      silent: event.type === 'completed',  // 完成不响声音，报错和等待响
+      silent: event.type === 'completed',  // 完成不响声音，报错/等待/求助都响
       icon: iconPath
     })
     n.on('click', () => focusMainWindow(event.agentId))
@@ -139,6 +156,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('list-archived', async () => db.listArchived())
   ipcMain.handle('get-logs', async (_e, agentId: string) => db.getLogs(agentId))
   ipcMain.handle('kill-agent', async (_e, agentId: string) => server.killAgent(agentId))
+  ipcMain.handle('resume-agent', async (_e, agentId: string) => server.resumeAgent(agentId))
   ipcMain.handle('clear-archive', async () => db.clearArchive())
   ipcMain.handle('get-handoff', async (_e, agentId: string) => server.getHandoff(agentId))
 

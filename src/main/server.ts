@@ -2,7 +2,7 @@ import express from 'express'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { DogDb, AgentRow, AgentStatus, AgentRole } from './db'
 import { getRole } from './roles'
-import { openInTerminal, sendToTerminal } from './terminal'
+import { openInTerminal, sendToTerminal, resumeInTerminal } from './terminal'
 
 const PORT = 17890
 
@@ -23,6 +23,7 @@ interface AgentEvent {
     | 'waiting' | 'heartbeat'
     | 'submitted'     // 工程师交付，进入待验收
     | 'escalation'    // 质检上报 PM（红线触发）
+    | 'help_request'  // PM 向人类老板求助/请示（触发桌面通知 + 工位举手信号）
     | 'message'       // 狗间消息（仅用于 dashboard 展示）
   agentId: string
   dogName?: string
@@ -97,10 +98,13 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
       const dogName = ev.dogName ?? pickName()
       // PM 固定金色，员工按队列分配
       const accentColor = ev.accentColor ?? (isPm ? MANAGER_GOLD : pickColor())
+      // taskLabel 只是显示标签，夹短防止超长任务（如接手档案）刷爆面板；完整任务已在启动命令里给了 agent
+      const rawLabel = ev.taskLabel ?? '未命名任务'
+      const taskLabel = rawLabel.length > 200 ? rawLabel.slice(0, 200) + '…' : rawLabel
       const row: AgentRow = {
         id: ev.agentId,
         dogName,
-        taskLabel: ev.taskLabel ?? '未命名任务',
+        taskLabel,
         tool: ev.tool ?? 'unknown',
         role,
         status: ev.status ?? 'working',
@@ -149,7 +153,7 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
       let delivered = false
       if (projectId) {
         const team = db.listTeam(projectId)
-      const pm = team.find((a) => a.role === 'pm' || a.role === 'manager')
+        const pm = team.find((a) => a.role === 'pm' || a.role === 'manager')
         if (pm && pm.terminalApp) {
           sendToTerminal({
             agentId: pm.id,
@@ -165,6 +169,26 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
       return res.json({ ok: true, delivered })
     }
 
+    if (ev.type === 'help_request') {
+      // PM 向人类老板求助：记一条日志 + 广播（前端举手+光晕，主进程弹通知）
+      const agent = db.getAgent(ev.agentId)
+      db.appendLog({
+        agentId: ev.agentId,
+        ts: now,
+        level: 'warn',
+        content: `🙋 求助老板：${(ev.messageText ?? '').slice(0, 300)}`
+      })
+      const rt = runtime.get(ev.agentId)
+      if (rt) rt.lastHeartbeat = now
+      broadcast({
+        ...ev,
+        dogName: agent?.dogName,
+        taskLabel: agent?.taskLabel,
+        role: agent?.role
+      })
+      return res.json({ ok: true })
+    }
+
     if (ev.type === 'log' && ev.log) {
       db.appendLog({
         agentId: ev.agentId,
@@ -177,6 +201,18 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
     }
 
     if (ev.type === 'status' || ev.type === 'metrics' || ev.type === 'waiting') {
+      // 待验收保护：交付后 agent 仍会打印输出，wrapper 会自动推送 working/thinking/idle，
+      // 这些是空闲噪音，不能把"待验收"冲回"工作中"。只有真正返工（收到 dog send 反馈）才会转回。
+      const cur = db.getAgent(ev.agentId)
+      if (
+        cur?.status === 'submitted' &&
+        (ev.status === 'working' || ev.status === 'thinking' || ev.status === 'idle')
+      ) {
+        const rt = runtime.get(ev.agentId)
+        if (rt) rt.lastHeartbeat = now
+        return res.json({ ok: true, held: 'submitted' })
+      }
+
       const patch: Partial<AgentRow> = { updatedAt: now }
       if (ev.status) patch.status = ev.status
       if (ev.currentAction !== undefined) patch.currentAction = ev.currentAction
@@ -280,6 +316,20 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
         level: 'meta',
         content: `收到消息：${text.slice(0, 200)}`
       })
+      // 收到反馈即返工：待验收的成员被打回，转回工作中
+      if (target.status === 'submitted') {
+        db.updateAgent(target.id, {
+          status: 'working',
+          currentAction: '收到反馈，返工中',
+          updatedAt: Date.now()
+        })
+        broadcast({
+          type: 'status',
+          agentId: target.id,
+          status: 'working',
+          currentAction: '收到反馈，返工中'
+        })
+      }
     }
     res.json(result)
   })
@@ -334,6 +384,10 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
   setInterval(() => {
     const now = Date.now()
     for (const [id, rt] of runtime) {
+      // 撞额度暂停的狗：进程可能已退出（无心跳），但绝不能归档——要挂着等续接
+      if (db.getAgent(id)?.status === 'paused') {
+        continue
+      }
       const gap = now - rt.lastHeartbeat
       if (gap > 30_000) {
         // 长时间没心跳，认为狗已经死了，归档
@@ -393,6 +447,29 @@ export function startServer(db: DogDb, onEvent: (e: AgentEvent) => void) {
     getHandoff(agentId: string) {
       const text = db.buildHandoff(agentId)
       return text ? { ok: true, text } : { ok: false, error: '找不到该 agent' }
+    },
+    async resumeAgent(agentId: string) {
+      const agent = db.getAgent(agentId)
+      if (!agent) return { ok: false, error: '找不到该狗' }
+      const res = await resumeInTerminal({
+        id: agent.id,
+        dogName: agent.dogName,
+        taskLabel: agent.taskLabel,
+        role: agent.role,
+        tool: agent.tool,
+        cwd: agent.cwd,
+        projectId: agent.projectId,
+        parentId: agent.parentId,
+        terminalApp: agent.terminalApp
+      })
+      if (res.ok) {
+        const now = Date.now()
+        // 续接拉起后取消归档、回到工作态；wrapper 重连会再 upsert
+        db.updateAgent(agentId, { status: 'working', currentAction: '续接中…', archived: 0, updatedAt: now })
+        runtime.set(agentId, { lastHeartbeat: now })
+        broadcast({ type: 'status', agentId, status: 'working', currentAction: '续接中…' })
+      }
+      return res
     }
   }
 }

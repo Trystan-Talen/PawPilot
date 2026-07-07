@@ -10,16 +10,18 @@ import { DustParticles } from '@/components/effects/DustParticles'
 export default function App() {
   const setAgents = useAgentStore((s) => s.setAgents)
   const setArchived = useAgentStore((s) => s.setArchived)
+  const setProjects = useAgentStore((s) => s.setProjects)
   const applyEvent = useAgentStore((s) => s.applyEvent)
   const select = useAgentStore((s) => s.select)
 
   useEffect(() => {
     if (!window.dog) {
-      console.error('[dog-office] preload bridge missing — window.dog is undefined')
+      console.error('[pawpilot] preload bridge missing — window.dog is undefined')
       return
     }
     window.dog.listAgents().then((rows) => setAgents(rows as any)).catch(console.error)
     window.dog.listArchived().then((rows) => setArchived(rows as any)).catch(console.error)
+    window.dog.listProjects().then((rows) => setProjects(rows as any)).catch(console.error)
     const offEvent = window.dog.onAgentEvent((e) => applyEvent(e))
     // 通知点击 → 打开对应 agent 的详情
     const offSelect = window.dog.onSelectAgent((id) => select(id))
@@ -27,7 +29,7 @@ export default function App() {
       offEvent()
       offSelect()
     }
-  }, [setAgents, setArchived, applyEvent, select])
+  }, [setAgents, setArchived, setProjects, applyEvent, select])
 
   return (
     <div className="h-screen w-screen flex flex-col relative overflow-hidden app-shell" style={{ color: '#f7f2e8' }}>

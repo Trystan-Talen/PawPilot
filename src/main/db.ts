@@ -13,6 +13,7 @@ export type AgentStatus =
   | 'waiting'
   | 'lost'
   | 'interrupted'
+  | 'paused'      // 撞用量上限暂停，挂着等额度恢复后续接（不归档）
 
 // 9 角色 + 兼容老数据的 manager/worker
 export type AgentRole =

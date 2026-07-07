@@ -28,6 +28,7 @@ export interface DogApi {
   getLogs: (agentId: string) => Promise<any[]>
   getHandoff: (agentId: string) => Promise<{ ok: boolean; text?: string; error?: string }>
   killAgent: (agentId: string) => Promise<{ ok: boolean; error?: string }>
+  resumeAgent: (agentId: string) => Promise<{ ok: boolean; error?: string }>
   clearArchive: () => Promise<void>
   listRoles: () => Promise<
     {

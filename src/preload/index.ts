@@ -21,6 +21,7 @@ const api = {
   getLogs: (agentId: string) => ipcRenderer.invoke('get-logs', agentId),
   getHandoff: (agentId: string) => ipcRenderer.invoke('get-handoff', agentId),
   killAgent: (agentId: string) => ipcRenderer.invoke('kill-agent', agentId),
+  resumeAgent: (agentId: string) => ipcRenderer.invoke('resume-agent', agentId),
   clearArchive: () => ipcRenderer.invoke('clear-archive'),
   listRoles: () => ipcRenderer.invoke('list-roles'),
   listProjects: () => ipcRenderer.invoke('list-projects'),

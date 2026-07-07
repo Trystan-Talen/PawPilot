@@ -27,11 +27,20 @@ import urllib.parse
 import termios
 import fcntl
 import struct
+import socket
 
 DASHBOARD_URL = os.environ.get("DOG_DASHBOARD", "http://127.0.0.1:17890")
 HEARTBEAT_INTERVAL = 8.0   # 心跳秒数
 IDLE_TIMEOUT = 12.0        # 多久没输出 → idle/thinking
 ACTION_BUF_LIMIT = 180
+
+# 消息直连：server 把队友/PM 的消息写进这个 Unix socket，wrapper 注入子进程 PTY。
+# 放在 /tmp 下保证 socket 路径短（macOS AF_UNIX 路径上限 ~104 字节）且不受 TCC 保护。
+IPC_DIR = "/tmp/dogoffice-ipc"
+
+# UI 规范库（home 持久、跨项目）：UI 设计师开工先查、验收后沉淀，避免每个项目从零设计。
+UI_LIB_DIR = os.path.join(os.path.expanduser("~"), ".dog-office", "ui-library")
+UI_INDEX = os.path.join(UI_LIB_DIR, "index.json")
 
 # ---------- 输出解析器 ----------
 
@@ -51,6 +60,36 @@ WAITING_PATTERNS = [
     re.compile(r"\bwaiting for (input|approval)\b", re.I),
     re.compile(r"❯.*\?$"),
 ]
+
+# 鉴权失败：claude/codex 没登录或凭证失效（401）。识别出来标"鉴权失败"，
+# 别让它伪装成"thinking"误导 PM 和老板——一眼就知道该去 /login。
+AUTH_FAIL_PATTERNS = [
+    re.compile(r"Please run\s*/login", re.I),
+    re.compile(r"401\s*Invalid authentication", re.I),
+    re.compile(r"Failed to authenticate", re.I),
+    re.compile(r"Invalid authentication credentials", re.I),
+    re.compile(r"\bUnauthorized\b.*\b401\b|\b401\b.*\bUnauthorized\b", re.I),
+]
+
+
+def detect_auth_fail(line: str) -> bool:
+    return any(p.search(line) for p in AUTH_FAIL_PATTERNS)
+
+
+# 用量上限暂停：claude/Pro 额度用尽。识别出来标"⏸ 等额度"而非 lost，让狗挂着等额度恢复后续接，
+# 而不是被当掉线丢掉。
+USAGE_LIMIT_PATTERNS = [
+    re.compile(r"Stop and wait for limit to reset", re.I),
+    re.compile(r"\b(usage )?limit (reached|reset)", re.I),
+    re.compile(r"reached your (usage )?limit", re.I),
+    re.compile(r"limit will reset|resets? (at|in)\b", re.I),
+    re.compile(r"\b\d+-hour limit", re.I),
+    re.compile(r"Upgrade your plan", re.I),
+]
+
+
+def detect_usage_limit(line: str) -> bool:
+    return any(p.search(line) for p in USAGE_LIMIT_PATTERNS)
 
 SPINNER_RE = re.compile(r"^[\s⠀-⣿⠁-⠿⡀-⣿◐◓◑◒▁-▇\|/\-\\\.]*$")
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
@@ -84,7 +123,41 @@ def detect_action(line: str, tool: str) -> str | None:
     return clean
 
 
+# 启动命令 / 环境变量回显等噪音，不进活动流
+NOISE_MARKERS = (
+    "DOG_TASK_LABEL", "DOG_AGENT_ID", "DOG_TERMINAL_MARKER", "export PATH",
+    ".dog-office/launch/", "append-system-prompt", "/dog' run --", "/dog run --",
+)
+TOOL_ACTION_PREFIXES = ("●", "Running", "Bash(", "Edit(", "Read(", "Write(",
+                        "Grep(", "Glob(", "Search(", "Update(", "MultiEdit(")
+
+
+def is_noise(s: str) -> bool:
+    return any(m in s for m in NOISE_MARKERS)
+
+
+def detect_tool_action(line: str, tool: str) -> str | None:
+    """只识别"工具动作"（读写文件、跑命令、搜索…），不要泛化散文行——用于干净活动流。"""
+    if tool == "claude":
+        for pat, tpl in CLAUDE_PATTERNS:
+            m = pat.search(line)
+            if m:
+                try:
+                    return tpl.format(*m.groups())
+                except Exception:
+                    return tpl
+    s = line.strip()
+    if s.startswith(TOOL_ACTION_PREFIXES):
+        return s[:200]
+    return None
+
+
 # ---------- HTTP 客户端 ----------
+
+# dashboard 永远是本地 127.0.0.1。狗的环境里现在会被注入 http_proxy/https_proxy（为了让 claude 走代理连
+# Anthropic），但本地上报绝不能走代理。用一个强制空代理的 opener，跟 NO_PROXY 设没设无关，彻底防呆。
+_NOPROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def post(path: str, body: dict, timeout: float = 1.5) -> dict | None:
     try:
@@ -94,8 +167,14 @@ def post(path: str, body: dict, timeout: float = 1.5) -> dict | None:
             data=data,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _NOPROXY_OPENER.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx：把服务器返回的真实错误体透出来，而不是吞成"服务器无响应"
+        try:
+            return json.loads(e.read().decode("utf-8") or "{}")
+        except Exception:
+            return {"ok": False, "error": f"HTTP {e.code}"}
     except (urllib.error.URLError, TimeoutError, ConnectionError):
         return None
 
@@ -107,8 +186,20 @@ USAGE = """用法:
   dog team                                    查看本项目在岗成员
   dog send <狗名> "<消息>"                     发消息给队友
   dog submit "<交付说明>"                      声明交付，进入待验收
-  dog escalate "<病历内容>"                    （质检用）红线上报 PM
+  dog escalate "<病历内容>"                    红线上报 PM（员工/质检用）
+  dog ask "<求助内容>"                          （PM 用）向人类老板求助/请示
   dog hire <角色> --task "<任务>" [--tool X] [--model Y]   （PM 用）招聘
+  dog uilib <子命令>                            UI 规范库（设计师用，见 dog uilib help）
+"""
+
+UILIB_USAGE = """dog uilib —— UI 规范库（跨项目复用设计规范，避免每次从零）
+  dog uilib index                 打印 index.json 全量元数据（开工先看这个做语义匹配）
+  dog uilib list                  人类可读地列出所有规范
+  dog uilib search "<关键词>"      在名称/摘要/标签/基调里搜
+  dog uilib show <slug>           打印某份规范的 DESIGN.md 全文
+  dog uilib add <slug> --name "名" --summary "一句话" --tags "深色,B端,仪表盘" \\
+              [--tone "基调"] [--source "来源"] [--quality good|normal] [--design <路径>]
+                                  把规范沉淀进库（--design 默认取 ./docs/DESIGN.md）
 """
 
 
@@ -120,7 +211,7 @@ def self_id():
 def cmd_team():
     project_id = os.environ.get("DOG_PROJECT_ID", "")
     try:
-        with urllib.request.urlopen(
+        with _NOPROXY_OPENER.open(
             f"{DASHBOARD_URL}/api/team?projectId={urllib.parse.quote(project_id)}", timeout=3
         ) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -190,6 +281,231 @@ def cmd_escalate(args: list[str]):
     else:
         print("✗ 上报失败", file=sys.stderr)
         sys.exit(1)
+
+
+def _hook_action(tool: str, ti: dict) -> str | None:
+    """把一次工具调用提炼成一行人话（喂给活动流 + 工位屏幕）。"""
+    def short(s, n=120):
+        s = str(s).replace("\n", " ").strip()
+        return s if len(s) <= n else s[:n] + "…"
+
+    if tool == "Bash":
+        return f"$ {short(ti.get('command', ''))}"
+    if tool == "Read":
+        return f"读 {short(ti.get('file_path', ''))}"
+    if tool in ("Edit", "MultiEdit"):
+        return f"改 {short(ti.get('file_path', ''))}"
+    if tool == "Write":
+        return f"写 {short(ti.get('file_path', ''))}"
+    if tool == "NotebookEdit":
+        return f"改 {short(ti.get('notebook_path', ''))}"
+    if tool == "Grep":
+        return f"搜 {short(ti.get('pattern', ''))}"
+    if tool == "Glob":
+        return f"找 {short(ti.get('pattern', ''))}"
+    if tool == "WebFetch":
+        return f"抓取 {short(ti.get('url', ''))}"
+    if tool == "WebSearch":
+        return f"搜网 {short(ti.get('query', ''))}"
+    if tool == "TodoWrite":
+        return None  # 太碎，不进活动流
+    if not tool:
+        return None
+    return short(tool, 40)
+
+
+def cmd_hook(_args: list[str]):
+    """Claude Code 的 PostToolUse 钩子目标：读 stdin 里的工具调用 JSON，结构化上报 dashboard。
+    必须快、必须永不报错卡住 claude——所有异常一律静默退出 0。"""
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return
+    tool = data.get("tool_name", "") or ""
+    ti = data.get("tool_input", {}) or {}
+    action = _hook_action(tool, ti)
+    if not action:
+        return
+    agent_id = self_id()
+    if not agent_id:
+        return
+    # 一条进活动流（日志墙），一条更新工位屏幕的当前动作。短超时，dashboard 没响应也不拖累 claude。
+    post("/api/events", {
+        "type": "log", "agentId": agent_id,
+        "log": {"level": "tool", "content": action[:200]},
+    }, timeout=0.5)
+    post("/api/events", {
+        "type": "status", "agentId": agent_id,
+        "status": "working", "currentAction": action[:180],
+    }, timeout=0.5)
+
+
+def cmd_ask(args: list[str]):
+    """（PM 用）向人类老板求助/请示——触发桌面通知 + PM 工位举手+金色光晕。"""
+    text = " ".join(args)
+    if not text:
+        print('用法: dog ask "<要请示/求助老板的内容>"', file=sys.stderr)
+        sys.exit(2)
+    agent_id = self_id()
+    resp = post("/api/events", {
+        "type": "help_request",
+        "agentId": agent_id or "unknown",
+        "projectId": os.environ.get("DOG_PROJECT_ID"),
+        "messageText": text,
+    }, timeout=15)
+    if resp and resp.get("ok"):
+        print("✓ 已向老板发出求助信号（桌面通知 + 工位举手）。保持在岗，等老板回话。")
+    else:
+        print("✗ 求助信号发送失败", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------- UI 规范库 ----------
+
+def _uilib_load_index() -> dict:
+    try:
+        with open(UI_INDEX, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("specs"), list):
+            return data
+    except Exception:
+        pass
+    return {"version": 1, "specs": []}
+
+
+def _uilib_save_index(data: dict):
+    os.makedirs(UI_LIB_DIR, exist_ok=True)
+    with open(UI_INDEX, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _uilib_add(args: list[str]):
+    if not args or args[0].startswith("-"):
+        print(UILIB_USAGE, file=sys.stderr)
+        sys.exit(2)
+    slug = args[0]
+    opts = {"design": None, "name": None, "summary": None,
+            "tags": None, "tone": None, "source": None, "quality": "normal"}
+    i = 1
+    while i < len(args):
+        key = args[i][2:] if args[i].startswith("--") else None
+        if key in opts and i + 1 < len(args):
+            opts[key] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    design_path = opts["design"] or os.path.join(os.getcwd(), "docs", "DESIGN.md")
+    if not os.path.exists(design_path):
+        print(f"✗ 找不到设计文件 {design_path}（用 --design 指定）", file=sys.stderr)
+        sys.exit(1)
+    with open(design_path, "r", encoding="utf-8") as f:
+        design = f.read()
+    spec_dir = os.path.join(UI_LIB_DIR, slug)
+    os.makedirs(spec_dir, exist_ok=True)
+    with open(os.path.join(spec_dir, "DESIGN.md"), "w", encoding="utf-8") as f:
+        f.write(design)
+    tags = [t.strip() for t in (opts["tags"] or "").replace("，", ",").split(",") if t.strip()]
+    now = int(time.time() * 1000)
+    meta = {
+        "slug": slug,
+        "name": opts["name"] or slug,
+        "summary": opts["summary"] or "",
+        "tags": tags,
+        "tone": opts["tone"] or "",
+        "source": opts["source"] or "",
+        "quality": "good" if opts["quality"] == "good" else "normal",
+        "updatedAt": now,
+    }
+    with open(os.path.join(spec_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    data = _uilib_load_index()
+    specs = data.get("specs", [])
+    existing = next((x for x in specs if x.get("slug") == slug), None)
+    if existing:
+        existing.update(meta)
+    else:
+        meta["createdAt"] = now
+        specs.append(meta)
+    data["specs"] = specs
+    _uilib_save_index(data)
+    print(f"✓ 已沉淀规范 [{slug}]「{meta['name']}」到 UI 规范库（当前共 {len(specs)} 份）")
+
+
+def cmd_uilib(args: list[str]):
+    sub = args[0] if args else "list"
+    rest = args[1:]
+
+    if sub in ("help", "-h", "--help"):
+        print(UILIB_USAGE)
+        return
+
+    if sub in ("index", "json"):
+        print(json.dumps(_uilib_load_index(), ensure_ascii=False, indent=2))
+        return
+
+    if sub in ("list", "ls"):
+        specs = _uilib_load_index().get("specs", [])
+        if not specs:
+            print("（UI 规范库还是空的——放手新建第一份，验收通过后用 `dog uilib add` 沉淀回来）")
+            return
+        print(f"UI 规范库共 {len(specs)} 份：\n")
+        for s in specs:
+            star = " ★优质" if s.get("quality") == "good" else ""
+            print(f"● [{s.get('slug')}] {s.get('name', '')}{star}")
+            if s.get("tags"):
+                print(f"  标签: {', '.join(s.get('tags', []))}")
+            if s.get("summary"):
+                print(f"  一句话: {s.get('summary', '')}")
+            meta_line = "  ".join(
+                x for x in (
+                    f"基调: {s.get('tone')}" if s.get("tone") else "",
+                    f"来源: {s.get('source')}" if s.get("source") else "",
+                ) if x
+            )
+            if meta_line:
+                print(f"  {meta_line}")
+            print()
+        return
+
+    if sub == "search":
+        q = " ".join(rest).strip().lower()
+        if not q:
+            print('用法: dog uilib search "<关键词>"', file=sys.stderr)
+            sys.exit(2)
+        hits = []
+        for s in _uilib_load_index().get("specs", []):
+            hay = " ".join([
+                s.get("name", ""), s.get("summary", ""), s.get("tone", ""),
+                " ".join(s.get("tags", [])),
+            ]).lower()
+            if q in hay:
+                hits.append(s)
+        if not hits:
+            print(f"（没找到匹配「{q}」的规范——可以新建）")
+            return
+        for s in hits:
+            print(f"● [{s.get('slug')}] {s.get('name', '')} — {s.get('summary', '')}")
+        return
+
+    if sub == "show":
+        if not rest:
+            print("用法: dog uilib show <slug>", file=sys.stderr)
+            sys.exit(2)
+        path = os.path.join(UI_LIB_DIR, rest[0], "DESIGN.md")
+        if not os.path.exists(path):
+            print(f"✗ 找不到规范 {rest[0]}（先 dog uilib list 看有哪些）", file=sys.stderr)
+            sys.exit(1)
+        with open(path, "r", encoding="utf-8") as f:
+            sys.stdout.write(f.read())
+        return
+
+    if sub == "add":
+        _uilib_add(rest)
+        return
+
+    print(UILIB_USAGE, file=sys.stderr)
+    sys.exit(2)
 
 
 def cmd_hire(args: list[str]):
@@ -324,6 +640,8 @@ def main():
         "running": True,
         "status": "working",
         "current_action": "正在启动…",
+        "last_logged": None,   # 活动流去重：上一条记进日志墙的事件
+        "limit_paused": False, # 撞用量上限暂停（区别于真掉线，进程退出后保持可续接）
     }
 
     # 准备给子进程的环境变量：
@@ -331,10 +649,14 @@ def main():
     # - 清掉 DOG_TOOL/DOG_ROLE/DOG_TASK_LABEL/DOG_NAME（这些是我自己的）
     # - 保留 DOG_TERMINAL_APP（同终端共享，子狗的按钮也能打开同一个窗口）
     # - 设 DOG_PARENT_ID=<我的 id>（子代孙代狗都能查到他爹）
+    # 首条 prompt 注入：claude 会自动跑位置参数的任务，但 codex/hermes 等交互式工具不会
+    # （它们只把 prompt 填进输入框、不自动回车）。这类工具裸起 TUI，由我在 TUI 就绪后注入首条 prompt。
+    init_prompt = os.environ.get("DOG_INIT_PROMPT")
+
     child_env = os.environ.copy()
     for key in (
         "DOG_AGENT_ID", "DOG_TOOL", "DOG_ROLE",
-        "DOG_TASK_LABEL", "DOG_NAME"
+        "DOG_TASK_LABEL", "DOG_NAME", "DOG_INIT_PROMPT"
     ):
         child_env.pop(key, None)
     child_env["DOG_PARENT_ID"] = agent_id
@@ -342,10 +664,14 @@ def main():
     child_env["DOG_SELF_ID"] = agent_id  # 子进程内的 dog 子命令（send/submit）凭这个知道"我是谁"
     # DOG_PROJECT_ID 不清除，自然继承给子孙
 
-    # === 不动你的终端模式 ===
-    # - 子进程 stdin 直接绑你的终端（要 raw 模式自己调，不经我）
-    # - 我只用 PTY 截子进程的输出，用于显示 + dashboard 解析
+    # === PTY pump 模式（像 script(1)）===
+    # - 子进程 stdin/stdout/stderr 全接 PTY slave —— 这样 wrapper 持有的 master_fd
+    #   既能截输出，又能把字节写进子进程的输入（消息直连的地基）。
+    # - 父终端设 raw，把你的按键原样转发进 master（TUI 才能用方向键/单键/Ctrl-C）。
+    # - server 通过 Unix socket 注入的消息也写进 master，等价于"在 agent 里打字+回车"。
     is_tty = sys.stdin.isatty()
+    stdin_fd = sys.stdin.fileno() if is_tty else None
+    saved_term = None  # 父终端原始 termios，退出时还原
 
     try:
         import pty
@@ -362,7 +688,7 @@ def main():
 
         proc = subprocess.Popen(
             cmd,
-            stdin=sys.stdin if is_tty else subprocess.PIPE,  # 直接绑你的终端
+            stdin=slave_fd,   # 子进程从 PTY 读输入，master 写入 = 喂给它
             stdout=slave_fd,
             stderr=slave_fd,
             close_fds=True,
@@ -370,6 +696,15 @@ def main():
             env=child_env,
         )
         os.close(slave_fd)
+
+        # 把父终端切 raw：按键不被行缓冲/回显拦截，原样进 master 给子进程
+        if is_tty:
+            try:
+                import tty as _tty
+                saved_term = termios.tcgetattr(stdin_fd)
+                _tty.setraw(stdin_fd)
+            except Exception:
+                saved_term = None
 
     except Exception:
         # 退化：没 PTY 直接 PIPE
@@ -382,6 +717,29 @@ def main():
             text=True,
             env=child_env,
         )
+
+    def restore_terminal():
+        if saved_term is not None and stdin_fd is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_term)
+            except Exception:
+                pass
+
+    # 消息注入：把文字当作"粘贴 + 回车"写进子进程 PTY。
+    # 用 bracketed paste（ESC[200~ … ESC[201~）包裹，保住多行不被提前提交，
+    # 再补一个回车提交（等价于老方案的 Cmd+V 然后 Enter）。
+    PASTE_START = b"\x1b[200~"
+    PASTE_END = b"\x1b[201~"
+
+    def inject_message(text: str):
+        if master_fd is None or not text:
+            return
+        try:
+            os.write(master_fd, PASTE_START + text.encode("utf-8") + PASTE_END)
+            time.sleep(0.08)
+            os.write(master_fd, b"\r")
+        except OSError:
+            pass
 
     # 窗口大小变化 → 通知子进程 PTY（让 TUI 重排）
     def on_winch(_signum, _frame):
@@ -437,6 +795,41 @@ def main():
 
     threading.Thread(target=heartbeat, daemon=True).start()
 
+    # 消息直连：开一个 Unix socket，server 把队友/PM 消息写进来，主循环注入子进程 PTY。
+    # 路径由 agent_id 推导，server 端同样推导，无需注册握手。
+    ipc_sock = None
+    ipc_path = None
+    try:
+        os.makedirs(IPC_DIR, exist_ok=True)
+        ipc_path = os.path.join(IPC_DIR, agent_id + ".sock")
+        try:
+            os.unlink(ipc_path)
+        except OSError:
+            pass
+        ipc_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ipc_sock.bind(ipc_path)
+        ipc_sock.listen(8)
+        ipc_sock.setblocking(False)
+        try:
+            os.chmod(ipc_path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        ipc_sock = None
+        ipc_path = None
+
+    def inject_from_line(line_bytes: bytes):
+        line = line_bytes.strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line.decode("utf-8"))
+            text = msg.get("text", "")
+        except Exception:
+            text = line.decode("utf-8", errors="replace")
+        if text:
+            inject_message(text)
+
     # 输出读取
     buf = b""
     line_count = 0
@@ -449,36 +842,79 @@ def main():
 
     def emit_line_parse_only(line: str):
         # 仅解析，不写 stdout（PTY 路径已经把原始 chunk 写过了）
+        # 干净活动流：只把"有意义的事件"写进日志墙，散文行只用来更新工位屏幕当前动作。
         nonlocal line_count
         line_count += 1
         clean = strip_ansi(line).rstrip("\n\r")
 
         if not clean.strip():
             return
+        # 启动命令 / 环境变量回显 → 噪音，丢弃
+        if is_noise(clean):
+            return
 
-        # 日志
-        level = "tool" if clean.startswith(("●", "Running", "Bash(", "Edit(", "Read(")) else "info"
-        post("/api/events", {
-            "type": "log",
-            "agentId": agent_id,
-            "log": {"level": level, "content": clean[:600]}
-        })
+        # 0a) 用量上限：标"⏸ 等额度"，记下暂停，等额度恢复后可续接（不当掉线丢掉）
+        if detect_usage_limit(clean):
+            state["limit_paused"] = True
+            state["status"] = "paused"
+            if state["last_logged"] != "PAUSED":
+                state["last_logged"] = "PAUSED"
+                post("/api/events", {
+                    "type": "status", "agentId": agent_id, "status": "paused",
+                    "currentAction": "⏸ 撞用量上限，等额度恢复后可点「继续」续接",
+                })
+                post("/api/events", {
+                    "type": "log", "agentId": agent_id,
+                    "log": {"level": "warn",
+                            "content": "⏸ 用量上限暂停：等额度恢复后在详情面板点「继续」续接。原文：" + clean[:120]},
+                })
+            return
 
-        # 等待输入检测
+        # 0) 鉴权失败（401/未登录）：标"鉴权失败"而非"thinking"，免得误导成"模型卡死"
+        if detect_auth_fail(clean):
+            state["status"] = "error"
+            if state["last_logged"] != "AUTHFAIL":
+                state["last_logged"] = "AUTHFAIL"
+                post("/api/events", {
+                    "type": "status", "agentId": agent_id, "status": "error",
+                    "currentAction": "🔑 鉴权失败：需在终端 /login（凭证失效/401）",
+                })
+                post("/api/events", {
+                    "type": "log", "agentId": agent_id,
+                    "log": {"level": "error",
+                            "content": "🔑 鉴权失败(401)：这只狗的工具没登录或凭证被踢下线，去终端 /login。原文：" + clean[:120]},
+                })
+            return
+
+        # 1) 等待输入：有意义事件，记一条
         if detect_waiting(clean):
             state["status"] = "waiting"
             post("/api/events", {
                 "type": "waiting",
                 "agentId": agent_id,
                 "status": "waiting",
-                "currentAction": clean[:ACTION_BUF_LIMIT]
+                "currentAction": clean[:ACTION_BUF_LIMIT],
             })
+            if state["last_logged"] != "WAIT":
+                state["last_logged"] = "WAIT"
+                post("/api/events", {
+                    "type": "log",
+                    "agentId": agent_id,
+                    "log": {"level": "warn", "content": "⏳ 等待你回应：" + clean[:160]},
+                })
             return
 
-        # 状态恢复 + 当前动作
-        action = detect_action(clean, tool)
-        if action:
-            state["current_action"] = action
+        # 2) 识别到的工具动作（读写文件 / 跑命令…）：记进活动流 + 更新当前动作
+        tool_action = detect_tool_action(clean, tool)
+        if tool_action:
+            if tool_action != state["last_logged"]:
+                state["last_logged"] = tool_action
+                post("/api/events", {
+                    "type": "log",
+                    "agentId": agent_id,
+                    "log": {"level": "tool", "content": tool_action[:200]},
+                })
+            state["current_action"] = tool_action
             state["last_output_ts"] = time.time()
             new_status = "working" if state["status"] in ("thinking", "waiting", "idle") else state["status"]
             state["status"] = new_status
@@ -486,19 +922,48 @@ def main():
                 "type": "status",
                 "agentId": agent_id,
                 "status": new_status,
-                "currentAction": action,
-                "progress": min(0.95, line_count / 200.0)
+                "currentAction": tool_action,
+                "progress": min(0.95, line_count / 200.0),
             })
+            return
 
-    # 主循环：只读子进程输出，不动 stdin（你的终端原样工作）
+        # 3) 普通散文行：只更新工位屏幕的"当前动作"，不进日志墙
+        action = detect_action(clean, tool)
+        if action:
+            state["current_action"] = action
+            state["last_output_ts"] = time.time()
+            if state["status"] in ("thinking", "waiting", "idle"):
+                state["status"] = "working"
+                post("/api/events", {
+                    "type": "status",
+                    "agentId": agent_id,
+                    "status": "working",
+                    "currentAction": action,
+                    "progress": min(0.95, line_count / 200.0),
+                })
+
+    # 主循环：多路复用——子进程输出 / 你的键盘 / server 注入的消息
     try:
         if master_fd is not None:
+            base_fds = [master_fd]
+            if stdin_fd is not None:
+                base_fds.append(stdin_fd)
+            if ipc_sock is not None:
+                base_fds.append(ipc_sock.fileno())
+            conn_bufs = {}  # fileno -> [conn_socket, bytearray]
+
+            # 首条 prompt 注入状态：等 TUI 渲染完（输出冒头后空闲 >1.5s）或最多 6s 后注入一次
+            init_injected = init_prompt is None
+            init_start = time.time()
+
             while True:
+                watch = list(base_fds) + list(conn_bufs.keys())
                 try:
-                    rs, _, _ = select.select([master_fd], [], [], 0.5)
+                    rs, _, _ = select.select(watch, [], [], 0.5)
                 except (OSError, ValueError):
                     break
 
+                # 1) 子进程输出 → 透传你的终端 + 解析给 dashboard
                 if master_fd in rs:
                     try:
                         chunk = os.read(master_fd, 4096)
@@ -506,12 +971,10 @@ def main():
                         break
                     if not chunk:
                         break
-                    # 原始字节透传给你的终端
                     try:
                         os.write(sys.stdout.fileno(), chunk)
                     except OSError:
                         pass
-                    # 缓冲按行解析给 dashboard
                     buf += chunk
                     while b"\n" in buf:
                         line_bytes, buf = buf.split(b"\n", 1)
@@ -521,7 +984,55 @@ def main():
                             line = line_bytes.decode("latin-1", errors="replace")
                         emit_line_parse_only(line)
 
-                if proc.poll() is not None and not (rs and master_fd in rs):
+                # 2) 你的键盘 → 写进子进程 PTY（终端透明转发）
+                if stdin_fd is not None and stdin_fd in rs:
+                    try:
+                        kin = os.read(stdin_fd, 4096)
+                        if kin:
+                            os.write(master_fd, kin)
+                    except OSError:
+                        pass
+
+                # 3) 新的消息连接
+                if ipc_sock is not None and ipc_sock.fileno() in rs:
+                    try:
+                        conn, _ = ipc_sock.accept()
+                        conn.setblocking(False)
+                        conn_bufs[conn.fileno()] = [conn, bytearray()]
+                    except OSError:
+                        pass
+
+                # 4) 消息数据 → 注入子进程
+                for cfd in list(conn_bufs.keys()):
+                    if cfd not in rs:
+                        continue
+                    conn, cbuf = conn_bufs[cfd]
+                    try:
+                        data = conn.recv(8192)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
+                        del conn_bufs[cfd]
+                        continue
+                    cbuf += data
+                    while b"\n" in cbuf:
+                        nl = cbuf.index(b"\n")
+                        inject_from_line(bytes(cbuf[:nl]))
+                        del cbuf[:nl + 1]
+
+                # 5) 交互式工具(codex/hermes)：TUI 就绪后注入首条 prompt + 回车（它们不自动跑）
+                if not init_injected:
+                    idle = time.time() - state["last_output_ts"]
+                    elapsed = time.time() - init_start
+                    if (line_count > 0 and idle > 1.5) or elapsed > 6:
+                        inject_message(init_prompt)
+                        init_injected = True
+
+                if proc.poll() is not None and master_fd not in rs:
                     break
         else:
             assert proc.stdout
@@ -529,6 +1040,17 @@ def main():
                 emit_line(line)
     finally:
         state["running"] = False
+        restore_terminal()
+        if ipc_sock is not None:
+            try:
+                ipc_sock.close()
+            except Exception:
+                pass
+        if ipc_path:
+            try:
+                os.unlink(ipc_path)
+            except OSError:
+                pass
         rc = proc.wait()
         # flush 残留
         if buf:
@@ -537,7 +1059,16 @@ def main():
             except Exception:
                 pass
 
-        if rc == 0:
+        if state.get("limit_paused"):
+            # 撞额度退出的：不当完成/出错，标 paused 让狗挂着等续接
+            post("/api/events", {
+                "type": "status",
+                "agentId": agent_id,
+                "status": "paused",
+                "currentAction": "⏸ 额度暂停，等恢复后点「继续」续接",
+            })
+            sys.stderr.write(f"\033[2m🐕 Dog Office: 撞用量上限，已暂停（可续接）\033[0m\n")
+        elif rc == 0:
             post("/api/events", {
                 "type": "completed",
                 "agentId": agent_id,
@@ -577,6 +1108,12 @@ if __name__ == "__main__":
         cmd_submit(argv[1:])
     elif sub == "escalate":
         cmd_escalate(argv[1:])
+    elif sub == "ask":
+        cmd_ask(argv[1:])
+    elif sub == "hook":
+        cmd_hook(argv[1:])
+    elif sub == "uilib":
+        cmd_uilib(argv[1:])
     elif sub == "hire":
         cmd_hire(argv[1:])
     elif sub == "run":

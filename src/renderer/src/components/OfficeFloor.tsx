@@ -10,8 +10,12 @@ export function OfficeFloor() {
   const focus = useAgentStore((s) => s.focus)
   const walkingOut = useAgentStore((s) => s.walkingOut)
   const openHire = useAgentStore((s) => s.openHire)
+  const currentProjectId = useAgentStore((s) => s.currentProjectId)
 
-  const list = Object.values(agents).sort((a, b) => a.startedAt - b.startedAt)
+  // 只显示当前项目的成员；currentProjectId === null 时显示"快速监控"（无项目归属的临时 agent）
+  const list = Object.values(agents)
+    .filter((a) => (a.projectId ?? null) === currentProjectId)
+    .sort((a, b) => a.startedAt - b.startedAt)
   const managers = list.filter((a) => isPmRole(a.role))
   const workers = list.filter((a) => !isPmRole(a.role))
 
@@ -34,22 +38,9 @@ export function OfficeFloor() {
 
   if (list.length === 0) {
     return (
-      <div
-        className="relative flex-1 flex flex-col items-center justify-center text-center px-6"
-        onClick={() => openHire(true, 'manager')}
-        role="button"
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            openHire(true, 'manager')
-          }
-        }}
-        aria-label="招聘主管"
-        style={{ cursor: 'pointer' }}
-      >
+      <div className="relative flex-1 flex flex-col items-center justify-center text-center px-6">
         <div
-          className="absolute w-[620px] max-w-[86vw] aspect-[2] rounded-full"
+          className="absolute w-[620px] max-w-[86vw] aspect-[2] rounded-full pointer-events-none"
           style={{
             background:
               'radial-gradient(ellipse, rgba(255,191,115,0.13), rgba(91,151,211,0.055) 42%, transparent 72%)',
@@ -72,40 +63,37 @@ export function OfficeFloor() {
           <EmptyOfficeMark />
         </div>
         <div className="relative text-xl font-semibold mb-2 tracking-wide" style={{ color: '#fff7e8' }}>
-          办公室还没人，安静得能听见心跳。
+          {currentProjectId ? '这个项目还没人' : '快速监控区还没有 agent'}
         </div>
         <div className="relative text-sm max-w-sm leading-7" style={{ color: 'rgba(255,247,232,0.58)' }}>
-          点击这里招一只<strong style={{ color: '#f59e0b' }}>主管</strong>来拆任务派活，
-          <br />
-          或者直接招<strong style={{ color: '#3aa8ff' }}>员工</strong>开干。
+          {currentProjectId ? (
+            <>招一只 <strong style={{ color: '#f59e0b' }}>PM</strong> 来拆任务派活，或直接招其他角色。</>
+          ) : (
+            <>在终端里跑 <code className="text-[12px] px-1 rounded" style={{ background: 'rgba(255,255,255,0.08)' }}>dog run …</code> 的 agent 会出现在这，
+            <br />或新建一个项目，让 <strong style={{ color: '#f59e0b' }}>PM</strong> 带队完成它。</>
+          )}
         </div>
 
         <div className="mt-8 flex gap-3">
           <button
-            onClick={(e) => {
-              e.stopPropagation()
-              openHire(true, 'manager')
-            }}
+            onClick={() => openHire(true, 'pm')}
             className="flex items-center gap-2 text-sm font-medium text-white px-5 py-2.5 rounded-lg transition-all hover:-translate-y-0.5"
             style={{
               background: 'linear-gradient(135deg, #f2bf64 0%, #e79522 100%)',
               boxShadow: '0 12px 28px -10px rgba(245,158,11,0.62), inset 0 1px rgba(255,255,255,0.28)'
             }}
           >
-            <span className="text-lg leading-none">+</span> 招聘主管
+            <span className="text-lg leading-none">+</span> 招 PM
           </button>
           <button
-            onClick={(e) => {
-              e.stopPropagation()
-              openHire(true, 'worker')
-            }}
+            onClick={() => openHire(true, 'fullstack')}
             className="flex items-center gap-2 text-sm font-medium text-white px-5 py-2.5 rounded-lg transition-all hover:-translate-y-0.5"
             style={{
               background: 'linear-gradient(135deg, #479de5 0%, #6c75df 100%)',
               boxShadow: '0 12px 28px -10px rgba(58,168,255,0.56), inset 0 1px rgba(255,255,255,0.25)'
             }}
           >
-            <span className="text-lg leading-none">+</span> 招聘员工
+            <span className="text-lg leading-none">+</span> 招其他角色
           </button>
         </div>
       </div>

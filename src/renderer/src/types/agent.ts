@@ -8,6 +8,7 @@ export type AgentStatus =
   | 'waiting'
   | 'lost'
   | 'interrupted'
+  | 'paused'      // 撞用量上限暂停，挂着等额度恢复后续接
 
 export type AgentRole =
   | 'pm'
@@ -57,6 +58,9 @@ export interface Agent {
   cwd: string | null
   command: string | null
   projectId: string | null
+  // 前端瞬态：PM 向人类老板求助时点亮（举手+金色光晕+角标），老板看一眼即清除
+  helpRequest?: boolean
+  helpText?: string
 }
 
 export interface LogEntry {

@@ -22,7 +22,8 @@ const STATUS_LABEL: Record<string, string> = {
   error: '出错',
   waiting: '等你回应',
   lost: '失联',
-  interrupted: '已中断'
+  interrupted: '已中断',
+  paused: '⏸ 等额度'
 }
 
 /**
@@ -74,6 +75,7 @@ export function Workstation({
   const isError = agent.status === 'error'
   const isLost = agent.status === 'lost'
   const isManager = isPmRole(agent.role)
+  const isHelping = !!agent.helpRequest
 
   // 狗的毛色调色板
   const fur = isManager
@@ -97,7 +99,7 @@ export function Workstation({
   return (
     <div
       onClick={onClick}
-      className={`group cursor-pointer select-none relative station-shell ${highlighted ? 'is-highlighted' : ''} ${walkingOut ? 'walking-out' : ''}`}
+      className={`group cursor-pointer select-none relative station-shell ${highlighted ? 'is-highlighted' : ''} ${isHelping ? 'is-helping' : ''} ${walkingOut ? 'walking-out' : ''}`}
       style={{
         opacity: entered && !walkingOut ? (dimmed ? 0.32 : 1) : 0,
         transform: walkingOut
@@ -659,6 +661,42 @@ export function Workstation({
             </g>
           )}
 
+          {/* === PM 求助信号：举手 + 金色感叹气泡（不放大狗，靠信号收拢注意力）=== */}
+          {isHelping && (
+            <g>
+              {/* 举起的右前爪（绕肩膀根部挥动）*/}
+              <g
+                style={{
+                  transformOrigin: '150px 150px',
+                  animation: 'paw-wave 0.9s ease-in-out infinite'
+                }}
+              >
+                <path
+                  d="M 148 152 Q 158 130 166 106"
+                  stroke={`url(#fur-body-${agent.id})`}
+                  strokeWidth="11"
+                  strokeLinecap="round"
+                  fill="none"
+                />
+                <circle cx="167" cy="103" r="8" fill={fur.highlight} stroke={fur.bodyShadow} strokeWidth="0.6" />
+                {/* 小肉垫 */}
+                <circle cx="167" cy="104" r="3" fill={fur.earOuter} opacity="0.55" />
+              </g>
+              {/* 金色求助气泡 */}
+              <g style={{ animation: 'breathe 1.2s ease-in-out infinite' }}>
+                <circle cx="186" cy="34" r="13" fill="#f5b942" stroke="#fff" strokeWidth="1.2" />
+                <text
+                  x="186"
+                  y="40"
+                  fontSize="16"
+                  fontWeight="900"
+                  fill="#1a1410"
+                  textAnchor="middle"
+                >!</text>
+              </g>
+            </g>
+          )}
+
           {/* === 进度条（桌沿前缘）=== */}
           <rect x="14" y="161.5" width="192" height="1.4" rx="0.7" fill="rgba(0,0,0,0.18)" />
           <rect
@@ -713,9 +751,18 @@ export function Workstation({
             )}
             {agent.tool}
           </span>
-          <span className="text-[9px]" style={{ color: statusColor }}>
-            {STATUS_LABEL[agent.status] ?? agent.status}
-          </span>
+          {isHelping ? (
+            <span
+              className="text-[9px] font-semibold px-1.5 py-px rounded-full flex items-center gap-1"
+              style={{ background: '#f5b942', color: '#1a1410', animation: 'breathe 1.2s ease-in-out infinite' }}
+            >
+              🙋 求助老板
+            </span>
+          ) : (
+            <span className="text-[9px]" style={{ color: statusColor }}>
+              {STATUS_LABEL[agent.status] ?? agent.status}
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -731,7 +778,8 @@ const STATUS_COLOR: Record<string, string> = {
   error: '#ef4444',
   waiting: '#f59e0b',
   lost: '#9aa0a8',
-  interrupted: '#f97316'
+  interrupted: '#f97316',
+  paused: '#eab308'
 }
 
 function formatElapsed(ms: number) {

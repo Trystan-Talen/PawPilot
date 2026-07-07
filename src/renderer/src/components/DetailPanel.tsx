@@ -48,6 +48,16 @@ export function DetailPanel() {
     : []
 
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [copied, setCopied] = useState<string | null>(null)
+  const logScrollRef = useRef<HTMLDivElement>(null)
+
+  // 新活动进来时，若已在底部附近则自动滚到底（不打断手动往上翻看）
+  useEffect(() => {
+    const el = logScrollRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [logs])
 
   useEffect(() => {
     if (!selectedId) return
@@ -124,8 +134,12 @@ export function DetailPanel() {
                     {agent.tool}
                   </span>
                 </div>
-                <div className="text-sm mt-0.5" style={{ color: 'rgba(255,247,232,0.72)' }}>
-                  {agent.taskLabel}
+                <div
+                  className="text-sm mt-0.5 overflow-y-auto whitespace-pre-wrap break-words"
+                  style={{ color: 'rgba(255,247,232,0.72)', maxHeight: 84 }}
+                  title={agent.taskLabel}
+                >
+                  {agent.taskLabel.length > 300 ? agent.taskLabel.slice(0, 300) + '…' : agent.taskLabel}
                 </div>
                 <div className="mt-2 text-[12px] font-mono" style={{ color: 'rgba(255,247,232,0.44)' }}>
                   {new Date(agent.startedAt).toLocaleTimeString('zh-CN')} 启动
@@ -241,39 +255,24 @@ export function DetailPanel() {
               <Stat label="花费" value={`$${agent.costUsd.toFixed(3)}`} />
             </div>
 
-            {/* 日志 */}
+            {/* 活动流 */}
             <div className="flex-1 min-h-0 flex flex-col">
-              <div className="px-5 py-2 text-[10px] tracking-widest uppercase text-[#8a8e99] border-b" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
-                实时日志 ({logs.length})
+              <div className="px-5 py-2 text-[10px] tracking-widest uppercase text-[#8a8e99] border-b flex items-center justify-between" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
+                <span>活动流 ({logs.length})</span>
+                <span className="normal-case tracking-normal text-[9px]" style={{ color: '#6a7080' }}>
+                  完整对话点「打开终端」
+                </span>
               </div>
               <div
-                className="flex-1 overflow-y-auto px-5 py-2 font-mono text-[11px] leading-relaxed"
+                ref={logScrollRef}
+                className="flex-1 overflow-y-auto px-4 py-2 font-mono text-[11px] leading-relaxed"
                 style={{ background: 'rgba(5,8,13,0.42)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}
               >
                 {logs.length === 0 && (
-                  <div className="text-[#8a8e99] italic py-4">还没有日志…</div>
+                  <div className="text-[#8a8e99] italic py-4">还没有活动…</div>
                 )}
                 {logs.map((l, i) => (
-                  <div key={i} className="flex gap-2 py-0.5 group">
-                    <span className="text-[#b8bcc6] flex-shrink-0">
-                      {new Date(l.ts).toLocaleTimeString('zh-CN', { hour12: false })}
-                    </span>
-                    <span
-                      className="flex-shrink-0 px-1 rounded text-[9px] uppercase font-bold"
-                      style={{
-                        color: LOG_COLOR[l.level] ?? '#aeb4c4',
-                        background: LOG_BG[l.level] ?? 'transparent'
-                      }}
-                    >
-                      {l.level}
-                    </span>
-                    <span
-                      className="text-[#c9d0dc] break-words whitespace-pre-wrap min-w-0 flex-1"
-                      style={{ color: l.level === 'error' ? '#fca5a5' : undefined }}
-                    >
-                      {l.content}
-                    </span>
-                  </div>
+                  <LogRow key={i} entry={l} />
                 ))}
               </div>
             </div>
@@ -281,39 +280,68 @@ export function DetailPanel() {
             {/* 对话输入框 + 底部操作 */}
             <div className="border-t border-black/[0.06]">
               <ChatInput agent={agent} />
+              {/* 续接：撞额度暂停/掉线的 claude 狗，额度恢复后带记忆接着干 */}
+              {agent.tool === 'claude' &&
+                ['paused', 'lost', 'interrupted', 'error'].includes(agent.status) && (
+                  <div className="px-4 pt-2">
+                    <button
+                      onClick={async () => {
+                        const r = await window.dog.resumeAgent(agent.id)
+                        if (!r.ok) alert('续接失败：' + (r.error ?? '未知'))
+                      }}
+                      title="用原会话记忆续接，接着把没做完的任务做完（额度恢复后再点）"
+                      className="w-full text-[12px] font-semibold px-3 py-2 rounded-md transition-all hover:-translate-y-0.5"
+                      style={{
+                        background: agent.status === 'paused' ? '#eab308' : 'rgba(234,179,8,0.14)',
+                        color: agent.status === 'paused' ? '#1a1410' : '#a07a08',
+                        border: '1px solid rgba(234,179,8,0.45)'
+                      }}
+                    >
+                      ▶ 继续{agent.status === 'paused' ? '（额度恢复后接着干）' : '（恢复这只狗的会话）'}
+                    </button>
+                  </div>
+                )}
               <div className="grid grid-cols-3 gap-2 px-4 pb-3 pt-1">
                 <button
                   onClick={() => window.dog.killAgent(agent.id)}
-                  disabled={
-                    agent.archived === 1 ||
-                    agent.status === 'done' ||
-                    agent.status === 'error' ||
-                    agent.status === 'interrupted'
+                  disabled={agent.archived === 1}
+                  title={
+                    agent.status === 'done' || agent.status === 'error' ||
+                    agent.status === 'interrupted' || agent.status === 'lost'
+                      ? '把这只已经停工/失联的狗清出办公室'
+                      : '终止进程并送它离场'
                   }
                   className="text-[12px] font-medium px-3 py-2 rounded-md border hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   style={{ color: '#c53b3b', borderColor: 'rgba(197,59,59,0.3)' }}
                 >
-                  终止
+                  {agent.status === 'done' || agent.status === 'error' ||
+                   agent.status === 'interrupted' || agent.status === 'lost'
+                    ? '清退'
+                    : '终止'}
                 </button>
                 <button
                   onClick={async () => {
                     const res = await window.dog.getHandoff(agent.id)
                     if (res.ok && res.text) {
                       navigator.clipboard.writeText(res.text)
+                      setCopied('handoff')
+                      setTimeout(() => setCopied(null), 1600)
                     }
                   }}
                   className="text-[12px] font-medium text-[#f0c36a] px-3 py-2 rounded-md border border-amber-300/20 hover:bg-amber-300/[0.08] transition-colors"
                 >
-                  接手上下文
+                  {copied === 'handoff' ? '✓ 已复制' : '接手上下文'}
                 </button>
                 <button
                   onClick={() => {
                     const text = logs.map((l) => `${new Date(l.ts).toISOString()} [${l.level}] ${l.content}`).join('\n')
                     navigator.clipboard.writeText(text)
+                    setCopied('logs')
+                    setTimeout(() => setCopied(null), 1600)
                   }}
                   className="text-[12px] font-medium text-[#d9cdb9] px-3 py-2 rounded-md border border-white/10 hover:bg-white/[0.06] transition-colors"
                 >
-                  复制日志
+                  {copied === 'logs' ? '✓ 已复制' : '复制日志'}
                 </button>
               </div>
             </div>
@@ -324,18 +352,64 @@ export function DetailPanel() {
   )
 }
 
+// 深色活动流背景上的可读配色
 const LOG_COLOR: Record<string, string> = {
-  info: '#6a7080',
-  warn: '#a36b00',
-  error: '#b91c1c',
-  tool: '#1e6cbf',
-  meta: '#6d28d9'
+  info: '#aeb4c4',
+  warn: '#fbbf24',
+  error: '#fca5a5',
+  tool: '#7fc4ff',
+  meta: '#c4b5fd'
 }
 const LOG_BG: Record<string, string> = {
-  warn: 'rgba(245,158,11,0.12)',
-  error: 'rgba(239,68,68,0.12)',
-  tool: 'rgba(58,168,255,0.12)',
-  meta: 'rgba(167,139,250,0.12)'
+  warn: 'rgba(251,191,36,0.16)',
+  error: 'rgba(239,68,68,0.16)',
+  tool: 'rgba(58,168,255,0.16)',
+  meta: 'rgba(167,139,250,0.16)'
+}
+
+const LOG_TAG: Record<string, string> = {
+  info: '动作',
+  warn: '等待',
+  error: '错误',
+  tool: '工具',
+  meta: '消息'
+}
+
+const LOG_CLAMP = 240   // 单条超过这个长度就折叠
+
+function LogRow({ entry }: { entry: LogEntry }) {
+  const [open, setOpen] = useState(false)
+  const long = entry.content.length > LOG_CLAMP
+  const shown = open || !long ? entry.content : entry.content.slice(0, LOG_CLAMP) + '…'
+  const color = LOG_COLOR[entry.level] ?? '#aeb4c4'
+  return (
+    <div className="flex gap-2 py-0.5 group items-start">
+      <span className="text-[#6a7080] flex-shrink-0 text-[10px] pt-px">
+        {new Date(entry.ts).toLocaleTimeString('zh-CN', { hour12: false })}
+      </span>
+      <span
+        className="flex-shrink-0 px-1 rounded text-[9px] font-bold pt-px"
+        style={{ color, background: LOG_BG[entry.level] ?? 'transparent' }}
+      >
+        {LOG_TAG[entry.level] ?? entry.level}
+      </span>
+      <span
+        className="break-words whitespace-pre-wrap min-w-0 flex-1"
+        style={{ color: entry.level === 'error' ? '#fca5a5' : '#d2d8e2' }}
+      >
+        {shown}
+        {long && (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="ml-1.5 text-[10px] underline"
+            style={{ color: '#7fc4ff' }}
+          >
+            {open ? '收起' : '展开'}
+          </button>
+        )}
+      </span>
+    </div>
+  )
 }
 
 function Stat({ label, value, unit }: { label: string; value: string; unit?: string }) {
