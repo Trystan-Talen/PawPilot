@@ -67,10 +67,11 @@ export function Workstation({
 
   const headDy =
     agent.status === 'idle' ? 10 :
+    agent.status === 'paused' ? 6 :
     agent.status === 'done' ? -6 :
     agent.status === 'waiting' ? -3 : 0
   const earUp = agent.status === 'waiting' || agent.status === 'done'
-  const earDown = agent.status === 'idle' || agent.status === 'lost'
+  const earDown = agent.status === 'idle' || agent.status === 'lost' || agent.status === 'paused'
 
   const isError = agent.status === 'error'
   const isLost = agent.status === 'lost'
@@ -625,6 +626,24 @@ export function Workstation({
                 fill="#1a1410"
                 textAnchor="middle"
               >!</text>
+            </g>
+          )}
+
+          {agent.status === 'submitted' && (
+            <g style={{ animation: 'breathe 1.8s ease-in-out infinite' }}>
+              <rect x="39" y="29" width="25" height="31" rx="3" fill="#fff7e8" stroke="#14b8a6" strokeWidth="1.4" />
+              <path d="M 45 38 H 58 M 45 44 H 56 M 45 50 H 53" stroke="#5a7f7a" strokeWidth="1.2" strokeLinecap="round" />
+              <circle cx="60" cy="56" r="7" fill="#14b8a6" />
+              <path d="M 56.5 56 L 59 58.5 L 64 52.5" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+            </g>
+          )}
+
+          {agent.status === 'paused' && (
+            <g style={{ animation: 'breathe 2.2s ease-in-out infinite' }}>
+              <circle cx="178" cy="42" r="13" fill="#eab308" stroke="#fff7e8" strokeWidth="1" />
+              <circle cx="178" cy="42" r="8" fill="none" stroke="#1a1410" strokeWidth="1.4" opacity="0.8" />
+              <path d="M 178 42 L 178 37 M 178 42 L 183 45" stroke="#1a1410" strokeWidth="1.5" strokeLinecap="round" />
+              <path d="M 171 29 L 167 24 M 185 29 L 189 24" stroke="#eab308" strokeWidth="2.4" strokeLinecap="round" />
             </g>
           )}
 
